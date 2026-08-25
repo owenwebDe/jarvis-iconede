@@ -1,0 +1,487 @@
+"""
+TTS Pre-generation Job — Background job that pre-generates Edge TTS audio
+for story chapters when the server is idle.
+
+Priority queue (dynamic, recalculated on every call):
+  P0: Next chapter (n+1) after the one user is currently listening to
+  P1: Upcoming chapters (n+2, n+3...) of the same story user is listening to
+  P2: First chapter of stories with no audio yet
+  P3: Sequential chapters round-robin across remaining stories
+"""
+import asyncio
+import json
+import logging
+import os
+import re
+import threading
+import time
+from pathlib import Path
+from typing import Optional
+
+from helpers.path_safety import safe_story_path
+
+import edge_tts
+
+from services.background_jobs import BackgroundJobRunner, BackgroundJobScheduler
+from core.database import get_db_session
+from helpers.audio_cache import get_audio_cache_path, get_content_hash, AUDIO_CACHE_DIR
+from helpers.text_processing import clean_text_for_tts
+from services import story_audio_index  # SSoT for per-chapter status (data/story_chapters)
+
+logger = logging.getLogger("tts_pregen_job")
+
+# Paths — CWD-relative (Docker WORKDIR=/app), consistent with rest of codebase
+STORIES_DIR = os.path.join("data", "stories")
+
+
+class TTSPreGenJob(BackgroundJobRunner):
+    """Pre-generate Edge TTS audio for all story chapters."""
+    
+    job_name = "tts_pregen"
+    
+    # Config
+    DISK_QUOTA_GB = 5.0
+    DISK_QUOTA_BYTES = int(DISK_QUOTA_GB * 1024 * 1024 * 1024)
+    EVICTION_THRESHOLD = 0.9  # trigger eviction at 90% quota
+    CHAPTER_DELAY = 15  # seconds between chapters (rate limit protection)
+    VOICE = "en-US-GuyNeural"
+    RATE = "+0%"
+    
+    def __init__(self, scheduler: BackgroundJobScheduler, pregen_stream=None):
+        self.scheduler = scheduler
+        self._pregen_stream = pregen_stream  # PregenStreamManager (optional, set later)
+        self._stats = {
+            "total_chapters": 0,
+            "done_chapters": 0,
+            "current_story": None,
+            "current_chapter": None,
+            "disk_usage_mb": 0,
+            "errors": 0,
+            "last_error": None,
+        }
+        self._last_sig = None  # last reconciled story-tree fingerprint (change-detection)
+        # Serialise reconciles: rescan() (stories route) and _maybe_reconcile()
+        # (scheduler worker thread) can fire at once — one writer at a time avoids
+        # interleaved commits / "database is locked" on story_chapters.
+        self._reconcile_lock = threading.Lock()
+        self.rescan()
+    
+    def set_pregen_stream(self, stream):
+        """Set PregenStreamManager reference (called after both are initialized)."""
+        self._pregen_stream = stream
+    
+    def _emit(self, event: dict):
+        """Emit event to PregenStreamManager if available."""
+        if self._pregen_stream:
+            self._pregen_stream.broadcast(event)
+    
+    def get_currently_generating(self) -> dict | None:
+        """Return the chapter currently being generated, or None.
+        
+        This is the single source of truth for 'generating' status.
+        Lock files on disk are only for write coordination, NOT for status.
+        """
+        story = self._stats.get("current_story")
+        chapter = self._stats.get("current_chapter")
+        if story and chapter:
+            return {"story_title": story, "chapter_file": chapter}
+        return None
+    
+    def rescan(self):
+        """FORCE a reconcile of the story_chapters SSoT with disk, then refresh the
+        cached counts. Called at boot and by the stories API after a story is
+        added/removed (the event-driven trigger). Re-reads/re-hashes only changed
+        chapters — not the whole tree."""
+        try:
+            with self._reconcile_lock:
+                db = get_db_session()
+                try:
+                    sig = story_audio_index.signature()
+                    # verify_ready: a force pass also re-checks each ready chapter's
+                    # mp3 so an out-of-band deletion is re-queued.
+                    story_audio_index.reconcile(db, sig, verify_ready=True)
+                    self._last_sig = sig
+                    counts = story_audio_index.status_counts(db)
+                finally:
+                    db.close()
+            self._stats["total_chapters"] = counts["total"]
+            self._stats["done_chapters"] = counts["done"]
+        except Exception as e:  # noqa: BLE001 — never break boot / the stories route
+            logger.error(f"[PRE-GEN] rescan/reconcile failed: {e}", exc_info=True)
+        self._stats["disk_usage_mb"] = self._get_cache_size_mb()
+        logger.info(f"[PRE-GEN] Reconciled: {self._stats['done_chapters']}/"
+                    f"{self._stats['total_chapters']} chapters generated, "
+                    f"disk: {self._stats['disk_usage_mb']:.0f}MB")
+
+    def _maybe_reconcile(self):
+        """Cheap change-detection: fingerprint the story tree (one stat per chapter,
+        no read/hash) and reconcile ONLY when it changed since last time. Runs on a
+        worker thread (see get_next_task) so neither the stat sweep nor a real
+        reconcile ever blocks the event loop."""
+        sig = story_audio_index.signature()
+        if sig == self._last_sig:
+            return
+        try:
+            with self._reconcile_lock:
+                if sig == self._last_sig:   # another reconcile just did this fingerprint
+                    return
+                db = get_db_session()
+                try:
+                    counts = story_audio_index.reconcile(db, sig)
+                    self._last_sig = sig
+                    self._stats["total_chapters"] = counts["total"]
+                finally:
+                    db.close()
+        except Exception as e:  # noqa: BLE001 — a transient DB error just skips this cycle,
+            logger.error(f"[PRE-GEN] reconcile failed: {e}", exc_info=True)  # never crash the scheduler
+    
+    async def get_next_task(self) -> dict | None:
+        """Next chapter to generate, by priority (P0→P3). The heavy work — the
+        story-tree fingerprint + any reconcile, and the disk-quota sweep — runs on
+        a worker thread so it NEVER blocks the event loop (the old inline per-tick
+        full scan stalled it ~1s every 10s). Picking the task itself is one indexed
+        query against the story_chapters SSoT — no disk, no hashing."""
+        # Keep the SSoT in sync with disk (only when the tree changed) + quota — off-loop.
+        await asyncio.to_thread(self._maybe_reconcile)
+        if not await asyncio.to_thread(self._ensure_disk_quota):
+            return None  # over quota even after eviction — skip this cycle
+
+        db = get_db_session()
+        try:
+            return story_audio_index.next_task(db)
+        finally:
+            db.close()
+
+    def _ensure_disk_quota(self) -> bool:
+        """Evict old audio if over quota. Returns False if still over quota after
+        eviction (caller should skip). Runs off-loop (disk I/O)."""
+        if self._get_cache_size_bytes() <= self.DISK_QUOTA_BYTES * self.EVICTION_THRESHOLD:
+            return True
+        evicted = self._evict_old_audio()
+        if evicted > 0:
+            logger.warning(f"[EVICTION] Evicted {evicted} files, "
+                          f"disk now: {self._get_cache_size_mb():.0f}MB")
+        return self._get_cache_size_bytes() <= self.DISK_QUOTA_BYTES * self.EVICTION_THRESHOLD
+    
+    async def execute_task(self, task: dict) -> bool:
+        """Generate audio for 1 chapter using Edge TTS with pause/cancel checkpoints."""
+        story_title = task["story_title"]
+        chapter_file = task["chapter_file"]
+        priority = task.get("priority", 9)
+        
+        logger.debug(f"[PRE-GEN] Generating: {story_title}/{chapter_file} (priority: P{priority})")
+        self._stats["current_story"] = story_title
+        self._stats["current_chapter"] = chapter_file
+        
+        # Emit chapter_generating event
+        self._emit({
+            "type": "chapter_generating",
+            "story_id": story_title,
+            "chapter_file": chapter_file,
+            "priority": priority,
+        })
+        
+        # Read and clean text
+        text = self._read_chapter_text(story_title, chapter_file)
+        if not text:
+            logger.warning(f"[PRE-GEN] Empty text: {story_title}/{chapter_file}")
+            return True  # Skip, not an error
+        
+        text = clean_text_for_tts(text)
+        cache_path = get_audio_cache_path(text)
+        
+        # Already done?
+        if os.path.exists(cache_path) and not os.path.exists(cache_path + ".lock"):
+            logger.debug(f"[PRE-GEN] Already exists: {story_title}/{chapter_file}")
+            self._stats["done_chapters"] += 1
+            self._mark_ready_status(story_title, chapter_file, text)
+            self._emit({
+                "type": "chapter_ready",
+                "story_id": story_title,
+                "chapter_file": chapter_file,
+            })
+            return True
+        
+        lock_path = cache_path + ".lock"
+        # Write to a temp file and atomically rename to cache_path ONLY after
+        # every chunk succeeds. A present cache_path then always means "complete
+        # chapter" — a mid-chapter chunk failure (raise/timeout) can never leave
+        # a truncated file that the cache-hit short-circuit above would serve
+        # forever (the stuttering/cut-out playback this PR fixes).
+        tmp_path = cache_path + ".tmp"
+        start_time = time.time()
+        bytes_written = 0
+        
+        try:
+            # Create lock file (indicates generation in progress)
+            with open(lock_path, "w") as f:
+                f.write(json.dumps({
+                    "job": "pregen",
+                    "story": story_title,
+                    "chapter": chapter_file,
+                    "started_at": time.time(),
+                }))
+            
+            # Generate TTS in bounded chunks (<= EDGE_MAX_CHUNK) with per-chunk
+            # retry + timeout. A single whole-chapter edge_tts request streams
+            # slower than playback and intermittently returns no audio /
+            # truncates (stuttering playback); small chunks are fast + reliable. Each
+            # chunk is buffered so a retried attempt can't duplicate audio.
+            from services.tts import EdgeTTSProvider, EDGE_CHUNK_TIMEOUT
+            text_chunks = EdgeTTSProvider._split_tiered(text)
+
+            with open(tmp_path, "wb") as audio_file:
+                for ci, ctext in enumerate(text_chunks):
+                    if not ctext.strip():
+                        continue
+                    # Pause/cancel checked BETWEEN chunks, NOT inside the
+                    # wait_for below: a pause must block here indefinitely until
+                    # resume, whereas the per-chunk timeout only guards a stalled
+                    # network request. Chunks are small so a cancel (user
+                    # switched chapter) lands within a few seconds — this is what
+                    # stops a stuck pre-gen from hanging the new chapter.
+                    await self.scheduler.check_pause_point()
+
+                    buf = bytearray()
+                    for attempt in range(1, 4):
+                        buf.clear()
+
+                        async def _consume():
+                            communicate = edge_tts.Communicate(ctext, self.VOICE, rate=self.RATE)
+                            async for chunk in communicate.stream():
+                                if chunk["type"] == "audio" and chunk["data"]:
+                                    buf.extend(chunk["data"])
+
+                        try:
+                            await asyncio.wait_for(_consume(), timeout=EDGE_CHUNK_TIMEOUT)
+                            if buf:
+                                break
+                        except asyncio.CancelledError:
+                            raise  # pause/cancel — let scheduler handle, never retry
+                        except Exception as exc:  # incl. TimeoutError (stalled request)
+                            if attempt >= 3:
+                                raise
+                            logger.warning(
+                                f"[PRE-GEN] {story_title}/{chapter_file} chunk "
+                                f"{ci + 1}/{len(text_chunks)} attempt {attempt} "
+                                f"failed ({exc}) — retrying"
+                            )
+                            await asyncio.sleep(0.4 * attempt)
+                    if not buf:
+                        raise RuntimeError(
+                            f"No audio for chunk {ci + 1}/{len(text_chunks)} after retries"
+                        )
+                    audio_file.write(buf)
+                    bytes_written += len(buf)
+
+            # All chunks succeeded — atomically publish. Until this point only
+            # tmp_path exists, so any earlier failure leaves no servable file.
+            os.replace(tmp_path, cache_path)
+
+            # Done — remove lock
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+
+            # Flip the SSoT to 'ready' (the source of truth the queue/status read).
+            self._mark_ready_status(story_title, chapter_file, text)
+
+            duration = time.time() - start_time
+            size_mb = bytes_written / (1024 * 1024)
+            self._stats["done_chapters"] += 1
+            self._stats["disk_usage_mb"] = self._get_cache_size_mb()
+            
+            logger.info(f"[PRE-GEN] Done: {story_title}/{chapter_file} "
+                       f"({size_mb:.1f}MB, {duration:.0f}s)")
+            
+            # Emit chapter_ready event
+            self._emit({
+                "type": "chapter_ready",
+                "story_id": story_title,
+                "chapter_file": chapter_file,
+                "duration_s": round(duration, 1),
+                "size_mb": round(size_mb, 2),
+            })
+            
+            # Rate limit delay
+            await asyncio.sleep(self.CHAPTER_DELAY)
+            return True
+            
+        except asyncio.CancelledError:
+            # KB2: Clean up partial file
+            logger.warning(f"[PRE-GEN] Cancelled: {story_title}/{chapter_file} "
+                          f"(after {bytes_written} bytes)")
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+            raise  # Let scheduler handle
+            
+        except Exception as e:
+            logger.error(f"[PRE-GEN] Error: {story_title}/{chapter_file}: {e}",
+                        exc_info=True)
+            self._stats["errors"] += 1
+            self._stats["last_error"] = f"{story_title}/{chapter_file}: {str(e)}"
+            # Clean up the partial temp file. cache_path is only created on full
+            # success (atomic replace above), so it is never left truncated —
+            # drop the old ``bytes_written == 0`` guard that, with chunked
+            # writes, left a partial cache_path that got served forever.
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+            # Emit error event
+            self._emit({
+                "type": "chapter_error",
+                "story_id": story_title,
+                "chapter_file": chapter_file,
+                "error": str(e),
+            })
+            return False
+    
+    def get_status(self) -> dict:
+        """Return status for /api/background/status — counts come from the SSoT
+        (one indexed query), not a disk scan."""
+        self._stats["disk_usage_mb"] = self._get_cache_size_mb()
+        total, done = self._stats["total_chapters"], self._stats["done_chapters"]
+        try:
+            db = get_db_session()
+            try:
+                counts = story_audio_index.status_counts(db)
+            finally:
+                db.close()
+            total, done = counts["total"], counts["done"]
+            self._stats["total_chapters"], self._stats["done_chapters"] = total, done
+        except Exception as e:  # noqa: BLE001 — status must never raise
+            logger.warning(f"[PRE-GEN] status_counts failed: {e}")
+        return {
+            "job_name": self.job_name,
+            "status": "running" if self._stats["current_chapter"] else "idle",
+            "total": total,
+            "done": done,
+            "current_chapter": (
+                f"{self._stats['current_story']}/{self._stats['current_chapter']}"
+                if self._stats["current_chapter"] else None
+            ),
+            "disk_usage_mb": self._stats["disk_usage_mb"],
+            "disk_quota_mb": int(self.DISK_QUOTA_GB * 1024),
+            "errors": self._stats["errors"],
+            "last_error": self._stats["last_error"],
+        }
+    
+    # --- Preview queue (for SSE initial snapshot + queue_update) ---
+
+    def preview_queue(self, story_id: str | None = None, limit: int = 10) -> list[dict]:
+        """Preview the upcoming generation queue (P0→P3), in execution order.
+        Reads the story_chapters SSoT — one indexed query set, no disk scan."""
+        try:
+            db = get_db_session()
+            try:
+                return story_audio_index.preview_queue(db, story_id=story_id, limit=limit)
+            finally:
+                db.close()
+        except Exception as e:  # noqa: BLE001 — preview must never raise
+            logger.error(f"[PRE-GEN] preview_queue error: {e}")
+            return []
+
+    def _mark_ready_status(self, story_title: str, chapter_file: str, cleaned_text: str) -> None:
+        """Record a chapter as generated in the SSoT (best-effort). ``cleaned_text``
+        is the text that was fed to TTS, so its hash IS the audio cache key."""
+        try:
+            db = get_db_session()
+            try:
+                story_audio_index.mark_ready(
+                    db, story_title, chapter_file, get_content_hash(cleaned_text))
+            finally:
+                db.close()
+        except Exception as e:  # noqa: BLE001 — never fail generation over a status write
+            logger.warning(f"[PRE-GEN] mark_ready failed for {story_title}/{chapter_file}: {e}")
+
+    # --- Disk management ---
+    
+    def _get_cache_size_bytes(self) -> int:
+        """Total size of audio_cache directory in bytes."""
+        total = 0
+        if os.path.exists(AUDIO_CACHE_DIR):
+            for f in os.listdir(AUDIO_CACHE_DIR):
+                path = os.path.join(AUDIO_CACHE_DIR, f)
+                if os.path.isfile(path):
+                    total += os.path.getsize(path)
+        return total
+    
+    def _get_cache_size_mb(self) -> float:
+        return self._get_cache_size_bytes() / (1024 * 1024)
+    
+    def _evict_old_audio(self) -> int:
+        """Smart eviction: played chapters (oldest first) → unplayed (oldest first)."""
+        try:
+            # Collect all mp3 files with metadata
+            files_with_meta = []
+            for f in os.listdir(AUDIO_CACHE_DIR):
+                if not f.endswith(".mp3"):
+                    continue
+                path = os.path.join(AUDIO_CACHE_DIR, f)
+                mtime = os.path.getmtime(path)
+                size = os.path.getsize(path)
+                files_with_meta.append({"path": path, "mtime": mtime, "size": size, "file": f})
+            
+            if not files_with_meta:
+                return 0
+            
+            # Sort by modification time (oldest first) — simple eviction
+            files_with_meta.sort(key=lambda x: x["mtime"])
+            
+            evicted = 0
+            evicted_hashes = []  # content_hash of each removed <hash>.mp3
+            target = self.DISK_QUOTA_BYTES * 0.8  # Evict down to 80%
+            current_size = self._get_cache_size_bytes()
+
+            for file_info in files_with_meta:
+                if current_size <= target:
+                    break
+                # Don't evict files with .lock (currently generating)
+                if os.path.exists(file_info["path"] + ".lock"):
+                    continue
+
+                os.remove(file_info["path"])
+                current_size -= file_info["size"]
+                evicted += 1
+                evicted_hashes.append(file_info["file"][:-4])  # strip ".mp3"
+                logger.debug(f"[EVICTION] Deleted: {file_info['file']} "
+                          f"(age: {(time.time() - file_info['mtime'])/3600:.0f}h)")
+
+            # Flip the SSoT rows for evicted audio back to 'pending' so the queue
+            # regenerates them (readiness is authoritative in story_chapters).
+            if evicted_hashes:
+                try:
+                    db = get_db_session()
+                    try:
+                        for h in evicted_hashes:
+                            story_audio_index.mark_pending_by_hash(db, h)
+                    finally:
+                        db.close()
+                except Exception as e:  # noqa: BLE001 — eviction must not fail over this
+                    logger.warning(f"[EVICTION] SSoT status reset failed: {e}")
+
+            return evicted
+        except Exception as e:
+            logger.error(f"[EVICTION] Error: {e}", exc_info=True)
+            return 0
+    
+    # --- Helpers ---
+    
+    def _read_chapter_text(self, story_title: str, chapter_file: str) -> Optional[str]:
+        """Read chapter text file content."""
+        # StoryProgress rows can carry attacker-controlled fields (LLM tool
+        # write path). Reject `..` / separator components before touching FS.
+        try:
+            path = safe_story_path(STORIES_DIR, story_title, chapter_file)
+        except ValueError as e:
+            logger.warning(f"[PRE-GEN] Rejected unsafe path for {story_title!r}/{chapter_file!r}: {e}")
+            return None
+        try:
+            if path.exists():
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+        except Exception as e:
+            logger.error(f"[PRE-GEN] Read error: {path}: {e}")
+        return None

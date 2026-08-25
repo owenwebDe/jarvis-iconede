@@ -1,0 +1,79 @@
+# Built-in skills manifest.
+#
+# Skills listed here ship with the Jarvis codebase. They can be EDITED via the
+# UI (so users can fine-tune wording) but cannot be DELETED — code-based agents
+# in agent.py reference these names directly, so deleting one would break the
+# agent runtime.
+#
+# When the UI Create flow adds a new skill, it does NOT append to this file.
+# Anything in skills/ that is missing from this list is treated as a
+# user-created skill and is freely deletable.
+#
+# Adding/removing entries here is reserved for repo maintainers when the
+# shipped skill set changes.
+builtin:
+  - algorithmic-art
+  - angular-developer
+  - api-design
+  - api-testing
+  - architecture
+  - audio-reading
+  - ba-workflow
+  - brainstorming
+  - brand-guidelines
+  - canvas-design
+  - cicd-pipeline
+  - claude-api
+  - code-review
+  - crawling
+  - cron-management
+  - debugging-strategies
+  - delegation-strategy
+  - design-system
+  - dev-workflow
+  - doc-coauthoring
+  - dso-workflow
+  - engineering-principles
+  - figma-designer
+  - finance
+  - frontend-design
+  - git-workflow
+  - implementation
+  - internal-comms
+  - iot-control
+  - jarvis-infra
+  - jarvis-knowledge
+  - kaizen
+  - mcp-authoring
+  - mcp-builder
+  - meeting-facilitator
+  - meeting-participant
+  - music-playback
+  - personal-assistant
+  - playwright-skill
+  - proactive-mode
+  - project-management
+  - python-patterns
+  - qe-workflow
+  - requirements-analysis
+  - research
+  - retrospective
+  - review-implementing
+  - scrape-web
+  - skill-creator
+  - slack-gif-creator
+  - software-architecture
+  - sprint-planning
+  - subagent-coordination
+  - system-design
+  - team-communication
+  - team-roster
+  - terminal-execution
+  - test-driven-development
+  - test-fixing
+  - theme-factory
+  - ui-ux-design
+  - user-context
+  - verification-before-completion
+  - web-artifacts-builder
+  - webapp-testing

@@ -1,0 +1,94 @@
+# ─── Python ──────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# ─── Node & Rust ─────────────────────────────────
+node_modules/
+**/node_modules/
+target/
+**/target/
+
+# ─── Local research / scratch ────────────────────
+.research/
+
+# ─── System / IDE ────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+.claude
+.config/.android/
+
+# ─── Secrets & Credentials ───────────────────────
+# (Note: User explicitly requested backend/.env & fastagent.secrets.yaml included for repo setup)
+backend/git-credentials
+backend/gitconfig
+backend/git-credentials.tmp
+backend/gitconfig.tmp
+backend/credentials.json
+backend/token.json
+backend/token_calendar.json
+backend/token_gmail.json
+backend/firebase-credentials.json
+backend/config/credentials/
+backend/.keys/
+.mcp.json
+backend/.gh-config/
+backend/.tool-outputs/
+
+# ─── Backend Runtime / Data ──────────────────────
+backend/.runtime/
+backend/.fast-agent/sessions/
+backend/.fast-agent/mcp_workspace/
+backend/fastagent.jsonl
+backend/roborock_session.json
+backend/temp_audio/
+backend/data/
+
+# ─── Logs ────────────────────────────────────────
+*.log
+**/*.log
+electron_log.txt
+build_log*.txt
+
+# ─── Database ────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+backend/data/*.bak.*
+
+# ─── Large / Binary Files ───────────────────────
+*.dmg
+*.zip
+*.iso
+*.tar.gz
+*.apk
+*.aab
+
+# Codex (sensitive credentials)
+.codex/
+backend/.codex/
+backend/meetings/
+
+# Antigravity
+.agents/
+backend/core/logs/
+.gitnexus
+
+# ─── Onboarding snapshots (contain secrets) ──────
+.onboard-backups/
+
+# ─── Playwright E2E (backend) ────────────────────
+backend/test-results/
+
+# ─── Frontend Playwright E2E + Vite cache ────────
+frontend/playwright-report/
+frontend/test-results/
+frontend/.vite/
+
+# ─── Skill auto-backups ──────────────────────────
+backend/.fast-agent/skills/**/*.bak

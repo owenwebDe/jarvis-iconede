@@ -1,0 +1,2350 @@
+// figma-ui-mcp — Figma Plugin main thread v1.2.1
+// Handles both WRITE (draw UI) and READ (extract design) operations.
+
+figma.showUI(__html__, { width: 320, height: 420, title: "Figma UI MCP Bridge" });
+
+// ─── UTILS ────────────────────────────────────────────────────────────────────
+
+function hexToRgb(hex) {
+  const h = hex.replace(/^#/, "").replace(/^(.)(.)(.)$/, "$1$1$2$2$3$3");
+  return {
+    r: parseInt(h.slice(0, 2), 16) / 255,
+    g: parseInt(h.slice(2, 4), 16) / 255,
+    b: parseInt(h.slice(4, 6), 16) / 255,
+  };
+}
+
+function rgbToHex({ r, g, b }) {
+  return "#" + [r, g, b]
+    .map(v => Math.round(v * 255).toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function solidFill(hex, fillOpacity) {
+  var fill = { type: "SOLID", color: hexToRgb(hex) };
+  if (fillOpacity !== undefined) fill.opacity = fillOpacity;
+  return [fill];
+}
+
+function solidStroke(hex) {
+  return [{ type: "SOLID", color: hexToRgb(hex) }];
+}
+
+function getFillHex(node) {
+  if (!node.fills || !node.fills.length) return null;
+  const f = node.fills.find(f => f.type === "SOLID");
+  return f ? rgbToHex(f.color) : null;
+}
+
+function getStrokeHex(node) {
+  if (!node.strokes || !node.strokes.length) return null;
+  const s = node.strokes.find(s => s.type === "SOLID");
+  return s ? rgbToHex(s.color) : null;
+}
+
+const FONT_STYLE_MAP = {
+  Regular: "Regular", Medium: "Medium",
+  SemiBold: "Semi Bold", Bold: "Bold", Light: "Light",
+  Thin: "Thin", Heavy: "Heavy",
+  "Condensed Heavy": "Condensed Heavy",
+  "Thin Italic": "Thin Italic",
+  "Light Italic": "Light Italic",
+  "Extra Bold": "Extra Bold",
+  "Semi Bold": "Semi Bold",
+};
+
+function findNodeById(id) {
+  return figma.currentPage.findOne(n => n.id === id)
+      || figma.root.findOne(n => n.id === id);
+}
+
+function findNodeByName(name) {
+  return figma.currentPage.findOne(n => n.name === name)
+      || figma.root.findOne(n => n.name === name);
+}
+
+function resolveNode(params) {
+  if (params.id)     return findNodeById(params.id);
+  if (params.nodeId) return findNodeById(params.nodeId);
+  if (params.name)   return findNodeByName(params.name);
+  return null;
+}
+
+function nodeToInfo(node) {
+  if (!node) return null;
+  const info = {
+    id:       node.id,
+    name:     node.name,
+    type:     node.type,
+    parentId: node.parent ? node.parent.id : null,
+  };
+  if ("x" in node)      info.x = Math.round(node.x);
+  if ("y" in node)      info.y = Math.round(node.y);
+  if ("width" in node)  info.width  = Math.round(node.width);
+  if ("height" in node) info.height = Math.round(node.height);
+  return info;
+}
+
+// ─── READ HELPERS ─────────────────────────────────────────────────────────────
+
+// Detect if a node is likely an icon (small vector/group/instance)
+function isLikelyIcon(node) {
+  if (!node || !("width" in node)) return false;
+  var w = node.width, h = node.height;
+  // Icons are typically small (8-64px) and roughly square
+  if (w < 8 || w > 80 || h < 8 || h > 80) return false;
+  var ratio = Math.max(w, h) / Math.min(w, h);
+  if (ratio > 1.5) return false;
+  var iconTypes = ["VECTOR", "BOOLEAN_OPERATION", "STAR", "POLYGON", "LINE"];
+  if (iconTypes.indexOf(node.type) !== -1) return true;
+  // Small instance or group with only vectors inside
+  if (node.type === "INSTANCE" || node.type === "GROUP" || node.type === "FRAME") {
+    if (!node.children || node.children.length === 0) return false;
+    if (node.children.length > 10) return false;
+    var allVectors = true;
+    for (var i = 0; i < node.children.length; i++) {
+      var ct = node.children[i].type;
+      if (iconTypes.indexOf(ct) === -1 && ct !== "GROUP" && ct !== "FRAME" && ct !== "BOOLEAN_OPERATION") {
+        allVectors = false; break;
+      }
+    }
+    return allVectors;
+  }
+  return false;
+}
+
+// Check if node has image fill
+function hasImageFill(node) {
+  try {
+    if (!node.fills || !node.fills.length) return false;
+    for (var i = 0; i < node.fills.length; i++) {
+      if (node.fills[i].type === "IMAGE" && node.fills[i].visible !== false) return true;
+    }
+  } catch(e) {}
+  return false;
+}
+
+// Collect all text content from a subtree (for truncated nodes summary)
+function collectTextContent(node, maxItems) {
+  if (!maxItems) maxItems = 10;
+  var texts = [];
+  function walk(n) {
+    if (texts.length >= maxItems) return;
+    if (n.type === "TEXT") {
+      var t = n.characters;
+      if (t && t.trim()) texts.push(t.trim().substring(0, 60));
+    }
+    if ("children" in n) {
+      for (var i = 0; i < n.children.length; i++) walk(n.children[i]);
+    }
+  }
+  walk(node);
+  return texts;
+}
+
+// Collect icon names from a subtree
+function collectIconNames(node, maxItems) {
+  if (!maxItems) maxItems = 10;
+  var icons = [];
+  function walk(n) {
+    if (icons.length >= maxItems) return;
+    if (isLikelyIcon(n)) icons.push(n.name);
+    if ("children" in n) {
+      for (var i = 0; i < n.children.length; i++) walk(n.children[i]);
+    }
+  }
+  walk(node);
+  return icons;
+}
+
+// Detail levels: "minimal" | "compact" | "full"
+// minimal: id, name, type, position, size, childCount — ~5% token cost
+// compact: + fill, stroke, cornerRadius, layout, text content — ~30% token cost
+// full:    + effects, segments, gradient details, boundVariables, inline SVG — 100% token cost
+function extractDesignTree(node, depth, maxDepth, detailLevel) {
+  if (depth === undefined) depth = 0;
+  if (maxDepth === undefined) maxDepth = 15;
+  if (!detailLevel) detailLevel = "full";
+  if (depth > maxDepth) return null;
+
+  var isMinimal = (detailLevel === "minimal");
+  var isCompact = (detailLevel === "compact");
+  var isFull    = (detailLevel === "full");
+
+  var info = {
+    id:    node.id,
+    name:  node.name,
+    type:  node.type,
+    x:     "x"      in node ? Math.round(node.x)      : undefined,
+    y:     "y"      in node ? Math.round(node.y)       : undefined,
+    width: "width"  in node ? Math.round(node.width)   : undefined,
+    height:"height" in node ? Math.round(node.height)  : undefined,
+  };
+
+  // Minimal: only basic info + childCount, skip all style properties
+  if (isMinimal) {
+    if ("children" in node && node.children.length) {
+      info.childCount = node.children.length;
+      if (node.type === "TEXT") { try { info.content = node.characters; } catch(e) {} }
+      info.children = node.children
+        .map(function(c) { return extractDesignTree(c, depth + 1, maxDepth, detailLevel); })
+        .filter(Boolean);
+    }
+    return info;
+  }
+
+  // ── Fill (multiple fills, gradients, images) ──
+  try {
+    if ("fills" in node && node.fills && node.fills.length) {
+      var fills = node.fills;
+      if (fills.length === 1 && fills[0].type === "SOLID") {
+        info.fill = rgbToHex(fills[0].color);
+        if (fills[0].opacity !== undefined && fills[0].opacity !== 1) {
+          info.fillOpacity = Math.round(fills[0].opacity * 100) / 100;
+        }
+      } else {
+        info.fills = [];
+        for (var fi = 0; fi < fills.length; fi++) {
+          var f = fills[fi];
+          var fd = { type: f.type, visible: f.visible !== false };
+          if (f.type === "SOLID") {
+            fd.color = rgbToHex(f.color);
+            if (f.opacity !== undefined && f.opacity !== 1) fd.opacity = Math.round(f.opacity * 100) / 100;
+          } else if (f.type === "GRADIENT_LINEAR" || f.type === "GRADIENT_RADIAL" || f.type === "GRADIENT_ANGULAR") {
+            fd.gradientStops = f.gradientStops ? f.gradientStops.map(function(gs) {
+              return { color: rgbToHex(gs.color), position: Math.round(gs.position * 100) / 100 };
+            }) : [];
+          } else if (f.type === "IMAGE") {
+            fd.scaleMode = f.scaleMode || "FILL";
+            fd.imageHash = f.imageHash || null;
+          }
+          info.fills.push(fd);
+        }
+      }
+    }
+  } catch(e) { /* skip fills */ }
+
+  // ── Stroke ──
+  try {
+    if ("strokes" in node && node.strokes && node.strokes.length) {
+      info.stroke = getStrokeHex(node);
+      if (node.strokeWeight) info.strokeWeight = node.strokeWeight;
+      if (node.strokeAlign) info.strokeAlign = node.strokeAlign;
+    }
+  } catch(e) { /* skip strokes */ }
+
+  // ── Corner radius (per-corner support) ──
+  try {
+    if ("cornerRadius" in node && node.cornerRadius !== 0) {
+      if (typeof node.cornerRadius === "number") {
+        info.cornerRadius = node.cornerRadius;
+      } else {
+        info.cornerRadius = {
+          tl: node.topLeftRadius || 0, tr: node.topRightRadius || 0,
+          br: node.bottomRightRadius || 0, bl: node.bottomLeftRadius || 0,
+        };
+      }
+    }
+  } catch(e) {}
+
+  // ── Opacity, visibility, blend mode, clip ──
+  try { if ("opacity" in node && node.opacity !== 1) info.opacity = Math.round(node.opacity * 100) / 100; } catch(e) {}
+  try { if ("visible" in node && !node.visible) info.visible = false; } catch(e) {}
+  try { if ("blendMode" in node && node.blendMode !== "NORMAL" && node.blendMode !== "PASS_THROUGH") info.blendMode = node.blendMode; } catch(e) {}
+  try { if ("clipsContent" in node && node.clipsContent) info.clipsContent = true; } catch(e) {}
+
+  // ── Bound Variables (Design Tokens) — full only ──
+  if (isFull) try {
+    if (node.boundVariables) {
+      var bv = {};
+      var bvKeys = Object.keys(node.boundVariables);
+      for (var bvi = 0; bvi < bvKeys.length; bvi++) {
+        var bvk = bvKeys[bvi];
+        var binding = node.boundVariables[bvk];
+        if (binding) {
+          // binding can be a single VariableAlias or array of them
+          if (Array.isArray(binding)) {
+            bv[bvk] = binding.map(function(b) { return b ? b.id : null; });
+          } else {
+            bv[bvk] = binding.id || null;
+          }
+        }
+      }
+      if (Object.keys(bv).length > 0) info.boundVariables = bv;
+    }
+  } catch(e) {}
+
+  // ── Effects (shadows, blurs) — full only ──
+  if (isFull) try {
+    if ("effects" in node && node.effects && node.effects.length) {
+      var effs = [];
+      for (var ei = 0; ei < node.effects.length; ei++) {
+        var eff = node.effects[ei];
+        if (eff.visible === false) continue;
+        var ed = { type: eff.type };
+        if (eff.color) ed.color = rgbToHex(eff.color);
+        if (eff.offset) ed.offset = { x: eff.offset.x, y: eff.offset.y };
+        if (eff.radius !== undefined) ed.radius = eff.radius;
+        if (eff.spread !== undefined) ed.spread = eff.spread;
+        effs.push(ed);
+      }
+      if (effs.length) info.effects = effs;
+    }
+  } catch(e) {}
+
+  // ── TEXT node — comprehensive extraction ──
+  if (node.type === "TEXT") {
+    try {
+      info.content = node.characters;
+      info.fill = getFillHex(node);
+      info.fontSize = node.fontSize;
+      info.fontFamily = node.fontName ? node.fontName.family : null;
+      info.fontWeight = node.fontName ? node.fontName.style : null;
+      if (node.lineHeight) {
+        if (node.lineHeight.unit === "AUTO") info.lineHeight = "auto";
+        else if (node.lineHeight.unit === "PERCENT") info.lineHeight = Math.round(node.lineHeight.value) + "%";
+        else info.lineHeight = node.lineHeight.value;
+      }
+      if (node.letterSpacing && node.letterSpacing.value !== 0) info.letterSpacing = node.letterSpacing.value;
+      info.textAlign = node.textAlignHorizontal;
+      if (node.textAlignVertical && node.textAlignVertical !== "TOP") info.textAlignVertical = node.textAlignVertical;
+      if (node.textDecoration && node.textDecoration !== "NONE") info.textDecoration = node.textDecoration;
+      if (node.textTruncation && node.textTruncation !== "DISABLED") info.textTruncation = node.textTruncation;
+      if (node.textAutoResize) info.textAutoResize = node.textAutoResize;
+    } catch(e) {
+      // Mixed text styles — extract per-segment with style runs
+      try {
+        info.content = node.characters;
+        info.fill = getFillHex(node);
+        info.textAlign = node.textAlignHorizontal;
+        info.mixedStyles = true;
+
+        // Extract style segments
+        if (node.characters.length > 0) {
+          var segments = [];
+          var text = node.characters;
+          var segStart = 0;
+
+          for (var si = 0; si <= text.length; si++) {
+            if (si === text.length || si > segStart) {
+              // Check if style changed at this position
+              var changed = (si === text.length);
+              if (!changed && si > 0) {
+                try {
+                  var prevFont = node.getRangeFontName(si - 1, si);
+                  var curFont = node.getRangeFontName(si, si + 1);
+                  var prevSize = node.getRangeFontSize(si - 1, si);
+                  var curSize = node.getRangeFontSize(si, si + 1);
+                  if (prevFont.family !== curFont.family || prevFont.style !== curFont.style || prevSize !== curSize) changed = true;
+                  // Check fill change
+                  try {
+                    var prevFills = node.getRangeFills(si - 1, si);
+                    var curFills = node.getRangeFills(si, si + 1);
+                    if (prevFills[0] && curFills[0] && prevFills[0].type === "SOLID" && curFills[0].type === "SOLID") {
+                      if (rgbToHex(prevFills[0].color) !== rgbToHex(curFills[0].color)) changed = true;
+                    }
+                  } catch(e4) {}
+                } catch(e5) {}
+              }
+
+              if (changed && segStart < si) {
+                var seg = { text: text.substring(segStart, si) };
+                try {
+                  var sFont = node.getRangeFontName(segStart, segStart + 1);
+                  seg.fontFamily = sFont.family;
+                  seg.fontWeight = sFont.style;
+                  seg.fontSize = node.getRangeFontSize(segStart, segStart + 1);
+                  var sFills = node.getRangeFills(segStart, segStart + 1);
+                  if (sFills && sFills[0] && sFills[0].type === "SOLID") seg.fill = rgbToHex(sFills[0].color);
+                } catch(e6) {}
+                segments.push(seg);
+                segStart = si;
+              }
+            }
+          }
+
+          if (segments.length > 1) {
+            info.segments = segments;
+            // Use first segment as representative
+            info.fontFamily = segments[0].fontFamily;
+            info.fontWeight = segments[0].fontWeight;
+            info.fontSize = segments[0].fontSize;
+            info.fill = segments[0].fill;
+          } else if (segments.length === 1) {
+            info.fontFamily = segments[0].fontFamily;
+            info.fontWeight = segments[0].fontWeight;
+            info.fontSize = segments[0].fontSize;
+            info.fill = segments[0].fill;
+          }
+        }
+      } catch(e2) { info.content = node.characters || ""; }
+    }
+  }
+
+  // ── Auto Layout (comprehensive) ──
+  try {
+    if ("layoutMode" in node && node.layoutMode !== "NONE") {
+      var pt = node.paddingTop, pr = node.paddingRight, pb = node.paddingBottom, pl = node.paddingLeft;
+      info.layout = {
+        mode:    node.layoutMode,
+        itemSpacing: node.itemSpacing,
+        align:   node.primaryAxisAlignItems,
+        crossAlign: node.counterAxisAlignItems,
+        paddingTop: pt, paddingRight: pr, paddingBottom: pb, paddingLeft: pl,
+      };
+      // Counter axis spacing (gap between wrapped rows/columns)
+      try { if (node.counterAxisSpacing !== undefined && node.counterAxisSpacing !== 0) info.layout.counterAxisSpacing = node.counterAxisSpacing; } catch(e2) {}
+      // Sizing modes
+      if (node.primaryAxisSizingMode) info.layout.primarySizing = node.primaryAxisSizingMode;
+      if (node.counterAxisSizingMode) info.layout.counterSizing = node.counterAxisSizingMode;
+      if (node.layoutWrap && node.layoutWrap !== "NO_WRAP") info.layout.wrap = node.layoutWrap;
+    }
+  } catch(e) {}
+
+  // ── Child layout properties ──
+  try { if ("layoutAlign" in node && node.layoutAlign && node.layoutAlign !== "INHERIT") info.layoutAlign = node.layoutAlign; } catch(e) {}
+  try { if ("layoutGrow" in node && node.layoutGrow !== 0) info.layoutGrow = node.layoutGrow; } catch(e) {}
+  try { if ("layoutPositioning" in node && node.layoutPositioning === "ABSOLUTE") info.layoutPositioning = "ABSOLUTE"; } catch(e) {}
+
+  // ── Constraints ──
+  try {
+    if ("constraints" in node && node.constraints) {
+      var ch = node.constraints.horizontal, cv = node.constraints.vertical;
+      if ((ch && ch !== "MIN") || (cv && cv !== "MIN")) {
+        info.constraints = { horizontal: ch, vertical: cv };
+      }
+    }
+  } catch(e) {}
+
+  // ── Component-specific info ──
+  if (node.type === "COMPONENT" || node.type === "COMPONENT_SET") {
+    try { info.description = node.description; } catch(e) {}
+  }
+  if (node.type === "INSTANCE") {
+    try {
+      var mainComp = node.mainComponent;
+      if (mainComp) { info.componentName = mainComp.name; info.componentId = mainComp.id; }
+    } catch(e) {}
+    try { if (node.overrides && node.overrides.length) info.overrideCount = node.overrides.length; } catch(e) {}
+  }
+
+  // ── VECTOR / BOOLEAN_OPERATION ──
+  if (node.type === "VECTOR" || node.type === "BOOLEAN_OPERATION") {
+    try { if (node.vectorPaths) info.pathCount = node.vectorPaths.length; } catch(e) {}
+  }
+
+  // ── Image detection — flag nodes with image fills (compact+full) ──
+  if ((isCompact || isFull) && hasImageFill(node)) {
+    info.hasImage = true;
+    info.imageHint = "Use figma_read screenshot with nodeId to extract this image";
+  }
+
+  // ── Icon detection — flag small vector/instance nodes (compact+full) ──
+  if ((isCompact || isFull) && isLikelyIcon(node)) {
+    info.isIcon = true;
+    info.iconHint = "Use figma_read export_svg with nodeId to extract SVG markup";
+  }
+
+  // ── Children ──
+  if ("children" in node && node.children.length) {
+    if (depth >= maxDepth) {
+      // At depth limit: summarize instead of truncating to empty []
+      info.childCount = node.children.length;
+      var texts = collectTextContent(node, 15);
+      if (texts.length) info.textContent = texts;
+      var icons = collectIconNames(node, 10);
+      if (icons.length) info.iconNames = icons;
+    } else {
+      info.children = node.children
+        .map(function(c) { return extractDesignTree(c, depth + 1, maxDepth, detailLevel); })
+        .filter(Boolean);
+    }
+  }
+
+  return info;
+}
+
+// Collect all unique colors, fonts, spacing from a design tree
+function extractTokens(tree) {
+  const colors = new Set();
+  const fonts  = new Set();
+  const sizes  = new Set();
+
+  function walk(node) {
+    if (node.fill)   colors.add(node.fill);
+    if (node.stroke) colors.add(node.stroke);
+    if (node.fontFamily && node.fontWeight) fonts.add(`${node.fontFamily}/${node.fontWeight}/${node.fontSize}px`);
+    if (node.width)  sizes.add(node.width);
+    if (node.height) sizes.add(node.height);
+    (node.children || []).forEach(walk);
+  }
+  walk(tree);
+
+  return {
+    colors: [...colors],
+    fonts:  [...fonts],
+    sizes:  [...sizes].sort((a, b) => a - b),
+  };
+}
+
+// ─── WRITE HANDLERS ───────────────────────────────────────────────────────────
+
+const handlers = {};
+
+handlers.status = async () => ({
+  connected:   true,
+  version:     "1.2.4",
+  fileName:    figma.root.name,
+  currentPage: figma.currentPage.name,
+  pageCount:   figma.root.children.length,
+  selection:   figma.currentPage.selection.map(nodeToInfo),
+});
+
+handlers.listPages = async () =>
+  figma.root.children.map(p => ({ id: p.id, name: p.name }));
+
+handlers.setPage = async ({ name }) => {
+  const page = figma.root.children.find(p => p.name === name);
+  if (!page) throw new Error(`Page "${name}" not found`);
+  await figma.setCurrentPageAsync(page);
+  return { id: page.id, name: page.name };
+};
+
+handlers.createPage = async ({ name }) => {
+  const existing = figma.root.children.find(p => p.name === name);
+  if (existing) return { id: existing.id, name: existing.name, existed: true };
+  const page = figma.createPage();
+  page.name = name;
+  return { id: page.id, name: page.name };
+};
+
+handlers.query = async ({ type, name, id }) => {
+  if (id) {
+    const n = findNodeById(id);
+    return n ? [nodeToInfo(n)] : [];
+  }
+  const results = figma.currentPage.findAll(n => {
+    if (type && name) return n.type === type && n.name === name;
+    if (type) return n.type === type;
+    if (name) return n.name === name;
+    return false;
+  });
+  return results.slice(0, 100).map(nodeToInfo);
+};
+
+handlers.create = async (params) => {
+  const {
+    type, parentId, name,
+    x = 0, y = 0, width = 100, height = 100,
+    fill, stroke, strokeWeight = 1, cornerRadius,
+    content = "", fontSize = 14, fontWeight = "Regular", lineHeight,
+    opacity, visible,
+  } = params;
+
+  let parent = figma.currentPage;
+  if (parentId) {
+    const p = findNodeById(parentId) || findNodeByName(parentId);
+    if (p) parent = p;
+  }
+
+  let node;
+
+  if (type === "FRAME" || type === "GROUP") {
+    node = figma.createFrame();
+    node.resize(width, height);
+    node.fills = fill ? solidFill(fill, params.fillOpacity) : [];
+    if (stroke) { node.strokes = solidStroke(stroke); node.strokeWeight = strokeWeight; }
+    if (cornerRadius !== undefined) node.cornerRadius = cornerRadius;
+
+    // Auto Layout support
+    // layoutMode: "HORIZONTAL" | "VERTICAL" | "NONE"
+    if (params.layoutMode && params.layoutMode !== "NONE") {
+      node.layoutMode = params.layoutMode;
+      // Alignment: how children align on each axis
+      if (params.primaryAxisAlignItems) node.primaryAxisAlignItems = params.primaryAxisAlignItems;
+      if (params.counterAxisAlignItems) node.counterAxisAlignItems = params.counterAxisAlignItems;
+
+      // Padding: supports uniform, axis-based, and individual
+      if (params.padding !== undefined) {
+        node.paddingTop = params.padding;
+        node.paddingBottom = params.padding;
+        node.paddingLeft = params.padding;
+        node.paddingRight = params.padding;
+      }
+      if (params.paddingHorizontal !== undefined) {
+        node.paddingLeft = params.paddingHorizontal;
+        node.paddingRight = params.paddingHorizontal;
+      }
+      if (params.paddingVertical !== undefined) {
+        node.paddingTop = params.paddingVertical;
+        node.paddingBottom = params.paddingVertical;
+      }
+      if (params.paddingTop !== undefined) node.paddingTop = params.paddingTop;
+      if (params.paddingBottom !== undefined) node.paddingBottom = params.paddingBottom;
+      if (params.paddingLeft !== undefined) node.paddingLeft = params.paddingLeft;
+      if (params.paddingRight !== undefined) node.paddingRight = params.paddingRight;
+
+      // Spacing between children
+      if (params.itemSpacing !== undefined) node.itemSpacing = params.itemSpacing;
+
+      // Sizing: default to FIXED so frame keeps its set width/height
+      node.primaryAxisSizingMode = params.primaryAxisSizingMode || "FIXED";
+      node.counterAxisSizingMode = params.counterAxisSizingMode || "FIXED";
+
+      // Clip content
+      if (params.clipsContent !== undefined) node.clipsContent = params.clipsContent;
+    }
+
+  } else if (type === "RECTANGLE") {
+    node = figma.createRectangle();
+    node.resize(width, height);
+    node.fills = fill ? solidFill(fill, params.fillOpacity) : [];
+    if (stroke) { node.strokes = solidStroke(stroke); node.strokeWeight = strokeWeight; }
+    if (cornerRadius !== undefined) node.cornerRadius = cornerRadius;
+
+  } else if (type === "ELLIPSE") {
+    node = figma.createEllipse();
+    node.resize(width, height);
+    node.fills = fill ? solidFill(fill, params.fillOpacity) : [];
+    if (stroke) { node.strokes = solidStroke(stroke); node.strokeWeight = strokeWeight; }
+
+  } else if (type === "LINE") {
+    node = figma.createLine();
+    node.resize(width || 100, 0);
+    node.fills = [];
+    if (stroke) { node.strokes = solidStroke(stroke); node.strokeWeight = strokeWeight; }
+
+  } else if (type === "TEXT") {
+    const style = FONT_STYLE_MAP[fontWeight] || "Regular";
+    await figma.loadFontAsync({ family: "Inter", style });
+    node = figma.createText();
+    node.fontName = { family: "Inter", style };
+    node.fontSize = fontSize;
+    node.characters = content;
+    if (fill) node.fills = solidFill(fill);
+    if (lineHeight) node.lineHeight = { value: lineHeight, unit: "PIXELS" };
+    // Text alignment
+    if (params.textAlignHorizontal) node.textAlignHorizontal = params.textAlignHorizontal;
+    if (params.textAlignVertical) node.textAlignVertical = params.textAlignVertical;
+    // Auto-resize: "WIDTH_AND_HEIGHT" (default, hug), "HEIGHT" (fixed width, auto height), "NONE" (fixed both)
+    if (params.textAutoResize) node.textAutoResize = params.textAutoResize;
+
+  } else if (type === "SVG") {
+    // Create vector node from SVG string using Figma's built-in API
+    var svgStr = params.svg;
+    if (!svgStr) throw new Error("SVG type requires 'svg' param with SVG markup string");
+    node = figma.createNodeFromSvg(svgStr);
+    // createNodeFromSvg returns a FRAME containing vectors — resize if needed
+    if (width && height) node.resize(width, height);
+
+    // Apply color to all vector children
+    // Detects whether icon uses fill or stroke style and applies accordingly
+    if ((fill || stroke) && node.findAll) {
+      var allVectors = node.findAll(function(n) { return n.type === "VECTOR"; });
+      for (var vi = 0; vi < allVectors.length; vi++) {
+        var vec = allVectors[vi];
+        var hasFill = vec.fills && vec.fills.length > 0 && vec.fills[0].type === "SOLID";
+        var hasStroke = vec.strokes && vec.strokes.length > 0;
+
+        if (fill) {
+          if (hasFill) {
+            // Filled icon (Fluent UI, Bootstrap, Phosphor): replace fill color
+            vec.fills = solidFill(fill);
+          } else if (hasStroke) {
+            // Stroke icon (Lucide): apply as stroke color
+            vec.strokes = solidStroke(fill);
+          } else {
+            // No fill or stroke yet: set fill (handles Fluent UI default black)
+            vec.fills = solidFill(fill);
+          }
+        }
+        if (stroke) {
+          vec.strokes = solidStroke(stroke);
+          vec.strokeWeight = strokeWeight;
+        }
+      }
+    }
+
+  } else if (type === "VECTOR") {
+    // Create vector paths from SVG path data (d attribute)
+    // Supports: diagonal lines, curves (bezier, quadratic, arcs), polygons, any shape
+    // params.paths: array of {d, windingRule?} or single string d
+    // params.d: shorthand — single path data string (alternative to paths)
+    // params.strokeCap: "NONE" | "ROUND" | "SQUARE" | "ARROW_LINES" | "ARROW_EQUILATERAL"
+    // params.strokeJoin: "MITER" | "BEVEL" | "ROUND"
+    var pathData = params.d || params.path;
+    var pathsArr = params.paths;
+
+    if (!pathData && !pathsArr) {
+      throw new Error('VECTOR type requires "d" (path data string) or "paths" (array of {d, windingRule})');
+    }
+
+    node = figma.createVector();
+    node.resize(width, height);
+
+    // Build vectorPaths
+    if (pathsArr && Array.isArray(pathsArr)) {
+      node.vectorPaths = pathsArr.map(function(p) {
+        return {
+          data: typeof p === "string" ? p : p.d,
+          windingRule: (typeof p === "object" && p.windingRule) ? p.windingRule : "NONZERO"
+        };
+      });
+    } else {
+      node.vectorPaths = [{
+        data: pathData,
+        windingRule: params.windingRule || "NONZERO"
+      }];
+    }
+
+    // Fill and stroke
+    if (fill) {
+      node.fills = solidFill(fill, params.fillOpacity);
+    } else {
+      node.fills = [];
+    }
+    if (stroke) {
+      node.strokes = solidStroke(stroke);
+      node.strokeWeight = strokeWeight;
+    }
+
+    // Stroke styling
+    if (params.strokeCap) node.strokeCap = params.strokeCap;
+    if (params.strokeJoin) node.strokeJoin = params.strokeJoin;
+
+  } else if (type === "IMAGE") {
+    // Create a rectangle with an image fill from base64 data
+    // params.imageData: base64-encoded image (PNG/JPG)
+    // params.scaleMode: "FILL" | "FIT" | "CROP" | "TILE" (default "FILL")
+    var imgData = params.imageData;
+    if (!imgData) throw new Error("IMAGE type requires 'imageData' param with base64 string");
+
+    // Decode base64 to Uint8Array using manual lookup table
+    // (plugin sandbox may not have atob)
+    var B64CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var lookup = {};
+    for (var li = 0; li < B64CHARS.length; li++) { lookup[B64CHARS[li]] = li; }
+
+    var cleanData = imgData.replace(/[^A-Za-z0-9+/]/g, "");
+    var outLen = Math.floor(cleanData.length * 3 / 4);
+    if (imgData.endsWith("==")) outLen -= 2;
+    else if (imgData.endsWith("=")) outLen -= 1;
+
+    var raw = new Uint8Array(outLen);
+    var j = 0;
+    for (var ci = 0; ci < cleanData.length; ci += 4) {
+      var a = lookup[cleanData[ci]] || 0;
+      var b = lookup[cleanData[ci+1]] || 0;
+      var c = lookup[cleanData[ci+2]] || 0;
+      var d = lookup[cleanData[ci+3]] || 0;
+      raw[j++] = (a << 2) | (b >> 4);
+      if (j < outLen) raw[j++] = ((b & 15) << 4) | (c >> 2);
+      if (j < outLen) raw[j++] = ((c & 3) << 6) | d;
+    }
+
+    var image = figma.createImage(raw);
+
+    node = figma.createRectangle();
+    node.resize(width, height);
+    if (cornerRadius !== undefined) node.cornerRadius = cornerRadius;
+    node.fills = [{
+      type: "IMAGE",
+      imageHash: image.hash,
+      scaleMode: params.scaleMode || "FILL"
+    }];
+    if (stroke) { node.strokes = solidStroke(stroke); node.strokeWeight = strokeWeight; }
+
+  } else {
+    throw new Error('Unsupported node type: "' + type + '". Use FRAME, RECTANGLE, ELLIPSE, LINE, TEXT, SVG, VECTOR, IMAGE.');
+  }
+
+  if (name)   node.name = name;
+  node.x = x;
+  node.y = y;
+  if (opacity !== undefined) node.opacity = opacity;
+  if (visible !== undefined) node.visible = visible;
+
+  if (parent !== figma.currentPage) {
+    parent.appendChild(node);
+
+    // Auto-set child layout properties when parent uses auto-layout
+    if (parent.layoutMode && parent.layoutMode !== "NONE" && "layoutAlign" in node) {
+      if (params.layoutAlign !== undefined) {
+        node.layoutAlign = params.layoutAlign;
+      }
+      // Do NOT auto-stretch text or icons — let auto-layout center them naturally
+      // Only stretch explicitly when requested via layoutAlign: "STRETCH"
+      if (params.layoutGrow !== undefined) {
+        node.layoutGrow = params.layoutGrow;
+      }
+    }
+  } else {
+    // Top-level node, still allow explicit layout props
+    if (params.layoutAlign !== undefined && "layoutAlign" in node) node.layoutAlign = params.layoutAlign;
+    if (params.layoutGrow !== undefined && "layoutGrow" in node) node.layoutGrow = params.layoutGrow;
+  }
+
+  return nodeToInfo(node);
+};
+
+handlers.modify = async (params) => {
+  const node = resolveNode(params);
+  if (!node) throw new Error(`Node not found: ${JSON.stringify(params)}`);
+
+  if (params.fill     !== undefined && "fills"   in node) node.fills   = solidFill(params.fill, params.fillOpacity);
+  if (params.fillOpacity !== undefined && params.fill === undefined && "fills" in node && node.fills && node.fills.length) {
+    // Update fillOpacity on existing fill without changing color
+    var existingFills = JSON.parse(JSON.stringify(node.fills));
+    existingFills[0].opacity = params.fillOpacity;
+    node.fills = existingFills;
+  }
+  if (params.stroke   !== undefined && "strokes" in node) {
+    node.strokes = solidStroke(params.stroke);
+    if (params.strokeWeight !== undefined) node.strokeWeight = params.strokeWeight;
+  }
+  if (params.x       !== undefined) node.x = params.x;
+  if (params.y       !== undefined) node.y = params.y;
+  if (params.opacity !== undefined) node.opacity = params.opacity;
+  if (params.visible !== undefined) node.visible = params.visible;
+  if (params.name    !== undefined) node.name = params.name;
+  if (params.cornerRadius !== undefined && "cornerRadius" in node) node.cornerRadius = params.cornerRadius;
+
+  if ((params.width !== undefined || params.height !== undefined) && "resize" in node) {
+    node.resize(params.width !== undefined ? params.width : node.width, params.height !== undefined ? params.height : node.height);
+  }
+
+  if (node.type === "TEXT") {
+    if (params.content !== undefined || params.fontWeight !== undefined || params.fontFamily !== undefined) {
+      const family = params.fontFamily || node.fontName.family;
+      const style = FONT_STYLE_MAP[params.fontWeight] || node.fontName.style;
+      await figma.loadFontAsync({ family, style });
+      node.fontName = { family, style };
+      if (params.content !== undefined) node.characters = params.content;
+    }
+    if (params.fontSize !== undefined) node.fontSize = params.fontSize;
+  }
+
+  // Auto Layout properties (modify existing frame)
+  if (node.type === "FRAME") {
+    if (params.layoutMode !== undefined) {
+      node.layoutMode = params.layoutMode === "NONE" ? "NONE" : params.layoutMode;
+    }
+    if (params.primaryAxisAlignItems !== undefined) node.primaryAxisAlignItems = params.primaryAxisAlignItems;
+    if (params.counterAxisAlignItems !== undefined) node.counterAxisAlignItems = params.counterAxisAlignItems;
+    if (params.padding !== undefined) {
+      node.paddingTop = params.padding;
+      node.paddingBottom = params.padding;
+      node.paddingLeft = params.padding;
+      node.paddingRight = params.padding;
+    }
+    if (params.paddingTop !== undefined) node.paddingTop = params.paddingTop;
+    if (params.paddingBottom !== undefined) node.paddingBottom = params.paddingBottom;
+    if (params.paddingLeft !== undefined) node.paddingLeft = params.paddingLeft;
+    if (params.paddingRight !== undefined) node.paddingRight = params.paddingRight;
+    if (params.itemSpacing !== undefined) node.itemSpacing = params.itemSpacing;
+    if (params.primaryAxisSizingMode !== undefined) node.primaryAxisSizingMode = params.primaryAxisSizingMode;
+    if (params.counterAxisSizingMode !== undefined) node.counterAxisSizingMode = params.counterAxisSizingMode;
+    if (params.clipsContent !== undefined) node.clipsContent = params.clipsContent;
+  }
+
+  // Child layout properties (when inside auto-layout parent)
+  if (params.layoutAlign !== undefined && "layoutAlign" in node) node.layoutAlign = params.layoutAlign;
+  if (params.layoutGrow !== undefined && "layoutGrow" in node) node.layoutGrow = params.layoutGrow;
+
+  return nodeToInfo(node);
+};
+
+handlers.delete = async (params) => {
+  const node = resolveNode(params);
+  if (!node) throw new Error(`Node not found: ${JSON.stringify(params)}`);
+  const info = nodeToInfo(node);
+  node.remove();
+  return Object.assign({ deleted: true }, info);
+};
+
+handlers.append = async function(params) {
+  var parentId = params.parentId || null;
+  var parentName = params.parentName || null;
+  var childId = params.childId || null;
+  var childName = params.childName || null;
+  var parent = parentId ? findNodeById(parentId) : (parentName ? findNodeByName(parentName) : null);
+  var child = childId ? findNodeById(childId) : (childName ? findNodeByName(childName) : null);
+  if (!parent || !child) throw new Error("Parent or child not found");
+  parent.appendChild(child);
+  return { parentId: parent.id, childId: child.id };
+};
+
+handlers.listComponents = async () => {
+  await figma.loadAllPagesAsync();
+  const comps = figma.root.findAllWithCriteria({ types: ["COMPONENT"] });
+  return comps.map(c => ({ id: c.id, name: c.name, key: c.key || null }));
+};
+
+handlers.instantiate = async function(params) {
+  var componentId = params.componentId || null;
+  var componentName = params.componentName || null;
+  var parentId = params.parentId || null;
+  var parentName = params.parentName || null;
+  var x = params.x || 0;
+  var y = params.y || 0;
+  var comp = null;
+  if (componentId) {
+    comp = figma.root.findOne(function(n) { return n.id === componentId && n.type === "COMPONENT"; });
+  } else if (componentName) {
+    comp = figma.root.findOne(function(n) { return n.name === componentName && n.type === "COMPONENT"; });
+  }
+  if (!comp) throw new Error("Component " + (componentId || componentName) + " not found");
+  var inst = comp.createInstance();
+  inst.x = x; inst.y = y;
+  var parent = parentId ? findNodeById(parentId) : (parentName ? findNodeByName(parentName) : null);
+  if (parent) parent.appendChild(inst);
+  return nodeToInfo(inst);
+};
+
+// ─── DESIGN LIBRARY HANDLERS ──────────────────────────────────────────────────
+
+var LIBRARY_NAME = "\uD83C\uDFA8 Design Library";
+var LIBRARY_X = -2000;
+var LIBRARY_Y = 0;
+
+handlers.ensure_library = async function() {
+  var existing = figma.currentPage.findOne(function(n) { return n.name === LIBRARY_NAME && n.type === "FRAME"; });
+  if (existing) return { id: existing.id, name: existing.name, existed: true };
+
+  // Create library frame off-canvas
+  var lib = figma.createFrame();
+  lib.name = LIBRARY_NAME;
+  lib.resize(1600, 900);
+  lib.x = LIBRARY_X;
+  lib.y = LIBRARY_Y;
+  lib.fills = [{ type: "SOLID", color: { r: 0.08, g: 0.08, b: 0.1 } }];
+
+  await figma.loadFontAsync({ family: "Inter", style: "Bold" });
+  await figma.loadFontAsync({ family: "Inter", style: "Regular" });
+
+  // Section: Colors
+  var colorsLabel = figma.createText();
+  colorsLabel.characters = "COLORS";
+  colorsLabel.fontName = { family: "Inter", style: "Bold" };
+  colorsLabel.fontSize = 11;
+  colorsLabel.fills = [{ type: "SOLID", color: { r: 0.4, g: 0.4, b: 0.5 } }];
+  colorsLabel.x = 24; colorsLabel.y = 24;
+  lib.appendChild(colorsLabel);
+
+  // Default color palette
+  var defaultColors = [
+    { name: "bg-base",        hex: "#0F1117", x: 24  },
+    { name: "bg-surface",     hex: "#191C24", x: 84  },
+    { name: "bg-elevated",    hex: "#1E2233", x: 144 },
+    { name: "accent-purple",  hex: "#6366F1", x: 204 },
+    { name: "positive-green", hex: "#00C896", x: 264 },
+    { name: "negative-red",   hex: "#FF4560", x: 324 },
+    { name: "text-primary",   hex: "#E8ECF4", x: 384 },
+    { name: "text-secondary", hex: "#6B7280", x: 444 },
+    { name: "border",         hex: "#1E2233", x: 504 },
+  ];
+
+  for (var ci = 0; ci < defaultColors.length; ci++) {
+    var c = defaultColors[ci];
+    var rgb = hexToRgb(c.hex);
+    var swatch = figma.createRectangle();
+    swatch.name = "color/" + c.name;
+    swatch.resize(48, 48);
+    swatch.x = c.x; swatch.y = 44;
+    swatch.cornerRadius = 8;
+    swatch.fills = [{ type: "SOLID", color: rgb }];
+    lib.appendChild(swatch);
+
+    var swatchLabel = figma.createText();
+    swatchLabel.characters = c.name;
+    swatchLabel.fontName = { family: "Inter", style: "Regular" };
+    swatchLabel.fontSize = 9;
+    swatchLabel.fills = [{ type: "SOLID", color: { r: 0.5, g: 0.5, b: 0.6 } }];
+    swatchLabel.x = c.x; swatchLabel.y = 98;
+    lib.appendChild(swatchLabel);
+  }
+
+  // Section: Text Styles
+  var textLabel = figma.createText();
+  textLabel.characters = "TEXT STYLES";
+  textLabel.fontName = { family: "Inter", style: "Bold" };
+  textLabel.fontSize = 11;
+  textLabel.fills = [{ type: "SOLID", color: { r: 0.4, g: 0.4, b: 0.5 } }];
+  textLabel.x = 24; textLabel.y = 130;
+  lib.appendChild(textLabel);
+
+  var textStyles = [
+    { name: "heading-2xl", size: 32, weight: "Bold",    fill: "#E8ECF4" },
+    { name: "heading-xl",  size: 24, weight: "Bold",    fill: "#E8ECF4" },
+    { name: "heading-lg",  size: 20, weight: "Bold",    fill: "#E8ECF4" },
+    { name: "heading-md",  size: 16, weight: "SemiBold",fill: "#E8ECF4" },
+    { name: "body-md",     size: 14, weight: "Regular", fill: "#E8ECF4" },
+    { name: "body-sm",     size: 12, weight: "Regular", fill: "#9CA3AF" },
+    { name: "caption",     size: 11, weight: "Regular", fill: "#6B7280" },
+    { name: "label",       size: 11, weight: "Medium",  fill: "#6B7280" },
+  ];
+
+  var txY = 152;
+  for (var ti = 0; ti < textStyles.length; ti++) {
+    var ts = textStyles[ti];
+    var style = ts.weight === "SemiBold" ? "Semi Bold" : ts.weight;
+    await figma.loadFontAsync({ family: "Inter", style: style });
+    var tn = figma.createText();
+    tn.name = "text/" + ts.name;
+    tn.characters = "Aa — " + ts.name + " / " + ts.size + "px";
+    tn.fontName = { family: "Inter", style: style };
+    tn.fontSize = ts.size;
+    tn.fills = solidFill(ts.fill);
+    tn.x = 24; tn.y = txY;
+    lib.appendChild(tn);
+    txY += ts.size + 16;
+  }
+
+  return { id: lib.id, name: lib.name, existed: false };
+};
+
+handlers.get_library_tokens = async function() {
+  var lib = figma.currentPage.findOne(function(n) { return n.name === LIBRARY_NAME && n.type === "FRAME"; });
+  if (!lib) return { error: "Library not found. Call ensure_library() first.", colors: [], textStyles: [] };
+
+  var colors = [];
+  var textStyles = [];
+
+  var children = lib.children || [];
+  for (var i = 0; i < children.length; i++) {
+    var child = children[i];
+    if (child.name && child.name.indexOf("color/") === 0 && child.type === "RECTANGLE") {
+      colors.push({ name: child.name.replace("color/", ""), hex: getFillHex(child) || "#000000" });
+    }
+    if (child.name && child.name.indexOf("text/") === 0 && child.type === "TEXT") {
+      textStyles.push({
+        name: child.name.replace("text/", ""),
+        fontSize: child.fontSize,
+        fontWeight: child.fontName ? child.fontName.style : "Regular",
+        fill: getFillHex(child) || "#ffffff",
+      });
+    }
+  }
+
+  return { libraryId: lib.id, colors: colors, textStyles: textStyles };
+};
+
+// ─── READ HANDLERS ────────────────────────────────────────────────────────────
+
+// get_selection — returns full design data for current selection (or specified node)
+handlers.get_selection = async function(params) {
+  var id = params ? (params.id || params.nodeId) : null;
+  var nodeName = params ? params.name : null;
+  var nodes;
+  if (id) {
+    nodes = [findNodeById(id)].filter(Boolean);
+  } else if (nodeName) {
+    nodes = [findNodeByName(nodeName)].filter(Boolean);
+  } else {
+    nodes = [].concat(figma.currentPage.selection);
+  }
+
+  if (!nodes.length) return { nodes: [], message: "Nothing selected" };
+
+  var maxDepth = (params && params.depth !== undefined) ? (params.depth === "full" ? 50 : Number(params.depth)) : 15;
+  var detailLevel = (params && params.detail) || "full";
+  return {
+    nodes: nodes.map(function(n) { return extractDesignTree(n, 0, maxDepth, detailLevel); }),
+    tokens: detailLevel !== "minimal" && nodes.length === 1 ? extractTokens(extractDesignTree(nodes[0], 0, maxDepth, detailLevel)) : null,
+  };
+};
+
+// get_design — full node tree with configurable depth
+// depth: number (default 10) or "full" for unlimited
+handlers.get_design = async function(params) {
+  var p = params || {};
+  var id = p.id, name = p.name;
+  var depthParam = p.depth !== undefined ? p.depth : 10;
+  var detailLevel = p.detail || "full"; // "minimal" | "compact" | "full"
+
+  var root;
+  if (id)   root = findNodeById(id);
+  else if (name) root = findNodeByName(name);
+  else      root = figma.currentPage;
+
+  if (!root) throw new Error("Node not found: id=" + (id || "none") + " name=" + (name || "none"));
+
+  var maxDepth = (depthParam === "full") ? 50 : Number(depthParam);
+  if (isNaN(maxDepth) || maxDepth < 1) maxDepth = 10;
+
+  try {
+    var tree = extractDesignTree(root, 0, maxDepth, detailLevel);
+
+    // Post-process: inline SVG for icon nodes (full mode only, max 20)
+    var iconCount = 0;
+    if (detailLevel !== "full") iconCount = 999; // skip inline SVG for non-full modes
+    async function inlineSvgForIcons(node) {
+      if (!node) return;
+      if (node.isIcon && node.id && iconCount < 20) {
+        try {
+          var figNode = findNodeById(node.id);
+          if (figNode) {
+            var svg = await exportNodeSvg(figNode);
+            if (svg && svg.length < 5000) {
+              node.svgMarkup = svg;
+              delete node.iconHint;
+              iconCount++;
+            }
+          }
+        } catch(e) { /* skip failed icon export */ }
+      }
+      if (node.children) {
+        for (var i = 0; i < node.children.length; i++) {
+          await inlineSvgForIcons(node.children[i]);
+        }
+      }
+    }
+    await inlineSvgForIcons(tree);
+
+    var tokens = extractTokens(tree);
+    var meta = { maxDepth: maxDepth, detail: detailLevel, nodeType: root.type };
+    if (detailLevel === "full") meta.inlinedIcons = iconCount;
+    return { tree: tree, tokens: (detailLevel !== "minimal" ? tokens : undefined), meta: meta };
+  } catch(e) {
+    throw new Error("[get_design] " + e.message + " nodeType=" + root.type + " id=" + root.id);
+  }
+};
+
+// scan_design — progressive scan for large/complex designs
+// Returns a structured summary: sections, all text content, all colors, component list, image nodes
+// Works on any size file without token overflow
+handlers.scan_design = async function(params) {
+  var p = params || {};
+  var id = p.id, name = p.name;
+  var root;
+  if (id) root = findNodeById(id);
+  else if (name) root = findNodeByName(name);
+  else root = figma.currentPage;
+  if (!root) throw new Error("Node not found");
+
+  var summary = {
+    rootId: root.id,
+    rootName: root.name,
+    rootType: root.type,
+    width: Math.round(root.width),
+    height: Math.round(root.height),
+    totalNodes: 0,
+    sections: [],      // top-level children with their text content
+    allText: [],       // every text node: id, content, font, color, position
+    allColors: {},     // color → count (usage frequency)
+    allFonts: {},      // "Inter/Bold/16px" → count
+    images: [],        // nodes with image fills
+    icons: [],         // likely icon nodes
+    components: [],    // component instances with names
+  };
+
+  function walkCount(node) {
+    summary.totalNodes++;
+
+    // Collect text
+    if (node.type === "TEXT") {
+      var textInfo = {
+        id: node.id, name: node.name,
+        x: Math.round(node.x), y: Math.round(node.y),
+        width: Math.round(node.width), height: Math.round(node.height),
+      };
+      try {
+        textInfo.content = node.characters;
+        textInfo.fill = getFillHex(node);
+        textInfo.fontSize = node.fontSize;
+        textInfo.fontFamily = node.fontName ? node.fontName.family : null;
+        textInfo.fontWeight = node.fontName ? node.fontName.style : null;
+      } catch(e) {
+        try { textInfo.content = node.characters; } catch(e2) {}
+      }
+      if (summary.allText.length < 500) summary.allText.push(textInfo);
+
+      // Count font usage
+      if (textInfo.fontFamily) {
+        var fontKey = textInfo.fontFamily + "/" + (textInfo.fontWeight || "Regular") + "/" + (textInfo.fontSize || "?") + "px";
+        summary.allFonts[fontKey] = (summary.allFonts[fontKey] || 0) + 1;
+      }
+    }
+
+    // Collect colors
+    try {
+      var hex = getFillHex(node);
+      if (hex) summary.allColors[hex] = (summary.allColors[hex] || 0) + 1;
+    } catch(e) {}
+    try {
+      var strokeHex = getStrokeHex(node);
+      if (strokeHex) summary.allColors[strokeHex] = (summary.allColors[strokeHex] || 0) + 1;
+    } catch(e) {}
+
+    // Collect images
+    if (hasImageFill(node) && summary.images.length < 50) {
+      summary.images.push({
+        id: node.id, name: node.name,
+        x: Math.round(node.x), y: Math.round(node.y),
+        width: Math.round(node.width), height: Math.round(node.height),
+      });
+    }
+
+    // Collect icons
+    if (isLikelyIcon(node) && summary.icons.length < 50) {
+      summary.icons.push({ id: node.id, name: node.name, width: Math.round(node.width), height: Math.round(node.height) });
+    }
+
+    // Collect component instances
+    if (node.type === "INSTANCE" && summary.components.length < 50) {
+      try {
+        var mc = node.mainComponent;
+        summary.components.push({
+          id: node.id, name: node.name,
+          componentName: mc ? mc.name : null,
+          componentId: mc ? mc.id : null,
+          width: Math.round(node.width), height: Math.round(node.height),
+        });
+      } catch(e) {}
+    }
+
+    // Recurse
+    if ("children" in node) {
+      for (var i = 0; i < node.children.length; i++) walkCount(node.children[i]);
+    }
+  }
+
+  // Build sections from top-level children
+  if ("children" in root) {
+    for (var ci = 0; ci < root.children.length; ci++) {
+      var child = root.children[ci];
+      var section = {
+        id: child.id, name: child.name, type: child.type,
+        x: Math.round(child.x), y: Math.round(child.y),
+        width: Math.round(child.width), height: Math.round(child.height),
+        childCount: "children" in child ? child.children.length : 0,
+      };
+      // Summarize text inside this section
+      var sectionTexts = collectTextContent(child, 20);
+      if (sectionTexts.length) section.textContent = sectionTexts;
+      section.iconCount = 0;
+      section.imageCount = 0;
+      // Quick count icons/images in section
+      function countAssets(n) {
+        if (isLikelyIcon(n)) section.iconCount++;
+        if (hasImageFill(n)) section.imageCount++;
+        if ("children" in n) { for (var i = 0; i < n.children.length; i++) countAssets(n.children[i]); }
+      }
+      countAssets(child);
+      summary.sections.push(section);
+    }
+  }
+
+  // Walk entire tree for comprehensive data
+  walkCount(root);
+
+  // Sort colors by usage
+  var colorEntries = Object.keys(summary.allColors).map(function(k) { return { color: k, count: summary.allColors[k] }; });
+  colorEntries.sort(function(a, b) { return b.count - a.count; });
+  summary.allColors = colorEntries.slice(0, 30); // top 30 colors
+
+  // Sort fonts by usage
+  var fontEntries = Object.keys(summary.allFonts).map(function(k) { return { font: k, count: summary.allFonts[k] }; });
+  fontEntries.sort(function(a, b) { return b.count - a.count; });
+  summary.allFonts = fontEntries;
+
+  return summary;
+};
+
+// search_nodes — find nodes by properties (color, type, font, name pattern)
+handlers.search_nodes = async function(params) {
+  var p = params || {};
+  var results = [];
+  var maxResults = p.limit || 50;
+
+  // Search criteria
+  var criteria = {
+    type: p.type || null,               // "TEXT", "FRAME", "RECTANGLE", etc.
+    namePattern: p.namePattern || null,  // wildcard pattern: "*header*"
+    fill: p.fill || null,               // hex color: "#FF0000"
+    fontFamily: p.fontFamily || null,    // "Inter"
+    fontWeight: p.fontWeight || null,    // "Bold"
+    fontSize: p.fontSize || null,        // 14
+    hasImage: p.hasImage || false,       // true = nodes with image fills
+    hasIcon: p.hasIcon || false,         // true = likely icon nodes
+    minWidth: p.minWidth || null,
+    maxWidth: p.maxWidth || null,
+    minHeight: p.minHeight || null,
+    maxHeight: p.maxHeight || null,
+  };
+
+  // Convert wildcard pattern to simple matcher
+  function matchName(name, pattern) {
+    if (!pattern) return true;
+    var parts = pattern.toLowerCase().split("*");
+    var str = name.toLowerCase();
+    var pos = 0;
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] === "") continue;
+      var idx = str.indexOf(parts[i], pos);
+      if (idx === -1) return false;
+      pos = idx + parts[i].length;
+    }
+    return true;
+  }
+
+  function matchNode(node) {
+    if (criteria.type && node.type !== criteria.type) return false;
+    if (criteria.namePattern && !matchName(node.name, criteria.namePattern)) return false;
+    if (criteria.fill) {
+      var nodeFill = getFillHex(node);
+      if (!nodeFill || nodeFill.toLowerCase() !== criteria.fill.toLowerCase()) return false;
+    }
+    if (node.type === "TEXT") {
+      try {
+        if (criteria.fontFamily && node.fontName && node.fontName.family !== criteria.fontFamily) return false;
+        if (criteria.fontWeight && node.fontName && node.fontName.style !== criteria.fontWeight) return false;
+        if (criteria.fontSize && node.fontSize !== criteria.fontSize) return false;
+      } catch(e) { /* mixed styles, skip font filter */ }
+    } else {
+      if (criteria.fontFamily || criteria.fontWeight || criteria.fontSize) return false;
+    }
+    if (criteria.hasImage && !hasImageFill(node)) return false;
+    if (criteria.hasIcon && !isLikelyIcon(node)) return false;
+    if (criteria.minWidth && node.width < criteria.minWidth) return false;
+    if (criteria.maxWidth && node.width > criteria.maxWidth) return false;
+    if (criteria.minHeight && node.height < criteria.minHeight) return false;
+    if (criteria.maxHeight && node.height > criteria.maxHeight) return false;
+    return true;
+  }
+
+  function walkAndMatch(node) {
+    if (results.length >= maxResults) return;
+    try {
+      if (matchNode(node)) {
+        var info = {
+          id: node.id, name: node.name, type: node.type,
+          x: Math.round(node.x), y: Math.round(node.y),
+          width: Math.round(node.width), height: Math.round(node.height),
+        };
+        try { info.fill = getFillHex(node); } catch(e) {}
+        if (node.type === "TEXT") {
+          try {
+            info.content = node.characters;
+            info.fontSize = node.fontSize;
+            info.fontFamily = node.fontName ? node.fontName.family : null;
+            info.fontWeight = node.fontName ? node.fontName.style : null;
+          } catch(e) { try { info.content = node.characters; } catch(e2) {} }
+        }
+        // Find page path for context
+        var path = [];
+        var parent = node.parent;
+        while (parent && parent.type !== "PAGE" && path.length < 5) {
+          path.unshift(parent.name);
+          parent = parent.parent;
+        }
+        if (path.length) info.path = path.join(" > ");
+        results.push(info);
+      }
+    } catch(e) { /* skip inaccessible nodes */ }
+    if ("children" in node) {
+      for (var i = 0; i < node.children.length; i++) {
+        if (results.length >= maxResults) return;
+        walkAndMatch(node.children[i]);
+      }
+    }
+  }
+
+  // Search scope: specific node or entire page
+  var root;
+  if (p.id) root = findNodeById(p.id);
+  else if (p.name) root = findNodeByName(p.name);
+  else root = figma.currentPage;
+
+  walkAndMatch(root);
+
+  return {
+    results: results,
+    total: results.length,
+    criteria: criteria,
+    truncated: results.length >= maxResults,
+  };
+};
+
+// get_page_nodes — shallow list of top-level frames on current page
+handlers.get_page_nodes = async () => {
+  const page = figma.currentPage;
+  return {
+    page: page.name,
+    nodes: page.children.map(function(n) {
+      return Object.assign(nodeToInfo(n), { childCount: "children" in n ? n.children.length : 0 });
+    }),
+  };
+};
+
+// screenshot — export node as PNG base64 (v1.2.5)
+handlers.screenshot = async function(params) {
+  var id = params ? (params.id || params.nodeId || null) : null;
+  var nodeName = params && params.name ? params.name : null;
+  var s = params && params.scale ? params.scale : 1;
+
+  var page = figma.currentPage;
+  var children = page.children;
+  var node = null;
+  var i;
+
+  // Deep search by ID — check top-level first, then deep search
+  if (id) {
+    for (i = 0; i < children.length; i++) {
+      if (children[i].id === id) { node = children[i]; break; }
+    }
+    if (!node) {
+      node = figma.currentPage.findOne(function(n) { return n.id === id; });
+    }
+  }
+  // Deep search by name
+  if (node === null && nodeName) {
+    for (i = 0; i < children.length; i++) {
+      if (children[i].name === nodeName) { node = children[i]; break; }
+    }
+    if (!node) {
+      node = figma.currentPage.findOne(function(n) { return n.name === nodeName; });
+    }
+  }
+  // Fallback: any exportable top-level node (FRAME, COMPONENT, COMPONENT_SET, SECTION)
+  if (node === null) {
+    var exportableTypes = ["FRAME", "COMPONENT", "COMPONENT_SET", "SECTION", "INSTANCE", "GROUP"];
+    for (i = 0; i < children.length; i++) {
+      if (exportableTypes.indexOf(children[i].type) !== -1) { node = children[i]; break; }
+    }
+  }
+  if (node === null) {
+    return Promise.reject(new Error("[v1.2.5] No exportable node found. children=" + children.length));
+  }
+
+  try {
+    var bytes = await node.exportAsync({ format: "PNG", constraint: { type: "SCALE", value: s } });
+  } catch(exportErr) {
+    return Promise.reject(new Error("[v1.2.4-export] " + exportErr.message + " type=" + node.type + " id=" + node.id));
+  }
+
+  // Figma plugin sandbox: no btoa, no TextEncoder — manual base64
+  try {
+    // exportAsync returns Uint8Array directly in Figma sandbox
+    var arr = bytes;
+    if (typeof Uint8Array !== "undefined" && !(bytes instanceof Uint8Array)) {
+      arr = new Uint8Array(bytes);
+    }
+    var CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var b64 = "";
+    var len = arr.length;
+    for (var j = 0; j < len; j += 3) {
+      var b0 = arr[j];
+      var b1 = j + 1 < len ? arr[j + 1] : 0;
+      var b2 = j + 2 < len ? arr[j + 2] : 0;
+      b64 += CHARS[b0 >> 2];
+      b64 += CHARS[((b0 & 3) << 4) | (b1 >> 4)];
+      b64 += j + 1 < len ? CHARS[((b1 & 15) << 2) | (b2 >> 6)] : "=";
+      b64 += j + 2 < len ? CHARS[b2 & 63] : "=";
+    }
+    return { dataUrl: "data:image/png;base64," + b64, nodeId: node.id, width: node.width, height: node.height };
+  } catch(encodeErr) {
+    return Promise.reject(new Error("[v1.2.4-encode] " + encodeErr.message));
+  }
+};
+
+// Manual UTF-8 decode for Figma sandbox (no TextDecoder available)
+function uint8ArrayToString(arr) {
+  var result = "";
+  var i = 0;
+  while (i < arr.length) {
+    var byte1 = arr[i++];
+    if (byte1 < 0x80) {
+      result += String.fromCharCode(byte1);
+    } else if (byte1 < 0xE0) {
+      var byte2 = arr[i++] & 0x3F;
+      result += String.fromCharCode(((byte1 & 0x1F) << 6) | byte2);
+    } else if (byte1 < 0xF0) {
+      var byte2 = arr[i++] & 0x3F;
+      var byte3 = arr[i++] & 0x3F;
+      result += String.fromCharCode(((byte1 & 0x0F) << 12) | (byte2 << 6) | byte3);
+    } else {
+      var byte2 = arr[i++] & 0x3F;
+      var byte3 = arr[i++] & 0x3F;
+      var byte4 = arr[i++] & 0x3F;
+      var codePoint = ((byte1 & 0x07) << 18) | (byte2 << 12) | (byte3 << 6) | byte4;
+      codePoint -= 0x10000;
+      result += String.fromCharCode(0xD800 + (codePoint >> 10), 0xDC00 + (codePoint & 0x3FF));
+    }
+  }
+  return result;
+}
+
+// Export node SVG — helper used by export_svg and inline icon extraction
+async function exportNodeSvg(node) {
+  var bytes = await node.exportAsync({ format: "SVG" });
+  var arr = (typeof Uint8Array !== "undefined" && !(bytes instanceof Uint8Array)) ? new Uint8Array(bytes) : bytes;
+  return uint8ArrayToString(arr);
+}
+
+// export_svg — export node as SVG string
+handlers.export_svg = async function(params) {
+  var id = params ? (params.id || params.nodeId) : null;
+  var nodeName = params ? params.name : null;
+  var node = null;
+  if (id) node = findNodeById(id);
+  if (!node && nodeName) {
+    node = figma.currentPage.findOne(function(n) { return n.name === nodeName; });
+  }
+  if (!node) node = figma.currentPage;
+  if (!node) throw new Error("Node not found");
+  var svg = await exportNodeSvg(node);
+  return { svg: svg, nodeId: node.id, width: Math.round(node.width), height: Math.round(node.height) };
+};
+
+// export_image — export node as base64 PNG/JPG (for saving to disk, not for inline display)
+handlers.export_image = async function(params) {
+  var id = params ? (params.id || params.nodeId) : null;
+  var nodeName = params ? params.name : null;
+  var format = (params && params.format) ? params.format.toUpperCase() : "PNG";
+  var scale = (params && params.scale) ? params.scale : 2;
+
+  if (format !== "PNG" && format !== "JPG") format = "PNG";
+
+  var node = null;
+  if (id) node = findNodeById(id);
+  if (!node && nodeName) {
+    node = figma.currentPage.findOne(function(n) { return n.name === nodeName; });
+  }
+  if (!node) throw new Error("Node not found for export");
+
+  var bytes = await node.exportAsync({ format: format, constraint: { type: "SCALE", value: scale } });
+  var arr = (typeof Uint8Array !== "undefined" && !(bytes instanceof Uint8Array)) ? new Uint8Array(bytes) : bytes;
+
+  // Manual base64 encode (Figma sandbox has no btoa)
+  var CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  var b64 = "";
+  var len = arr.length;
+  for (var j = 0; j < len; j += 3) {
+    var b0 = arr[j];
+    var b1 = j + 1 < len ? arr[j + 1] : 0;
+    var b2 = j + 2 < len ? arr[j + 2] : 0;
+    b64 += CHARS[b0 >> 2];
+    b64 += CHARS[((b0 & 3) << 4) | (b1 >> 4)];
+    b64 += j + 1 < len ? CHARS[((b1 & 15) << 2) | (b2 >> 6)] : "=";
+    b64 += j + 2 < len ? CHARS[b2 & 63] : "=";
+  }
+
+  return {
+    base64: b64,
+    format: format.toLowerCase(),
+    width: Math.round(node.width * scale),
+    height: Math.round(node.height * scale),
+    nodeId: node.id,
+    nodeName: node.name,
+    sizeBytes: len,
+  };
+};
+
+// ─── NEW READ OPERATIONS ─────────────────────────────────────────────────────
+
+// get_styles — read all local paint, text, effect, and grid styles
+// get_node_detail — CSS-like properties for a single node (no tree traversal)
+handlers.get_node_detail = async function(params) {
+  var id = params ? (params.id || params.nodeId) : null;
+  var nodeName = params ? params.name : null;
+  var node = null;
+  if (id) node = findNodeById(id);
+  if (!node && nodeName) node = figma.currentPage.findOne(function(n) { return n.name === nodeName; });
+  if (!node) throw new Error("Node not found");
+
+  var detail = {
+    id: node.id, name: node.name, type: node.type,
+    x: Math.round(node.x), y: Math.round(node.y),
+    width: Math.round(node.width), height: Math.round(node.height),
+  };
+
+  // Fill(s)
+  try {
+    if (node.fills && node.fills.length) {
+      detail.fills = [];
+      for (var fi = 0; fi < node.fills.length; fi++) {
+        var f = node.fills[fi];
+        if (f.visible === false) continue;
+        var fd = { type: f.type };
+        if (f.type === "SOLID") {
+          fd.color = rgbToHex(f.color);
+          if (f.opacity !== undefined && f.opacity !== 1) fd.opacity = Math.round(f.opacity * 100) / 100;
+        } else if (f.type === "GRADIENT_LINEAR" || f.type === "GRADIENT_RADIAL" || f.type === "GRADIENT_ANGULAR") {
+          fd.gradientStops = f.gradientStops ? f.gradientStops.map(function(gs) {
+            return { color: rgbToHex(gs.color), position: Math.round(gs.position * 100) / 100 };
+          }) : [];
+        } else if (f.type === "IMAGE") {
+          fd.scaleMode = f.scaleMode || "FILL";
+        }
+        detail.fills.push(fd);
+      }
+    }
+  } catch(e) {}
+
+  // Stroke
+  try {
+    if (node.strokes && node.strokes.length) {
+      detail.stroke = getStrokeHex(node);
+      detail.strokeWeight = node.strokeWeight;
+      detail.strokeAlign = node.strokeAlign;
+    }
+  } catch(e) {}
+
+  // Corner radius
+  try {
+    if ("cornerRadius" in node && node.cornerRadius !== 0) {
+      if (typeof node.cornerRadius === "number") {
+        detail.borderRadius = node.cornerRadius + "px";
+      } else {
+        detail.borderRadius = (node.topLeftRadius || 0) + "px " + (node.topRightRadius || 0) + "px " + (node.bottomRightRadius || 0) + "px " + (node.bottomLeftRadius || 0) + "px";
+      }
+    }
+  } catch(e) {}
+
+  // Opacity, blendMode, visible
+  try { if (node.opacity !== undefined && node.opacity !== 1) detail.opacity = Math.round(node.opacity * 100) / 100; } catch(e) {}
+  try { if (node.blendMode && node.blendMode !== "NORMAL" && node.blendMode !== "PASS_THROUGH") detail.blendMode = node.blendMode; } catch(e) {}
+  try { if ("visible" in node && !node.visible) detail.visible = false; } catch(e) {}
+
+  // Effects → CSS boxShadow
+  try {
+    if (node.effects && node.effects.length) {
+      var shadows = [];
+      for (var ei = 0; ei < node.effects.length; ei++) {
+        var eff = node.effects[ei];
+        if (eff.visible === false) continue;
+        if (eff.type === "DROP_SHADOW" || eff.type === "INNER_SHADOW") {
+          var c = eff.color;
+          var rgba = "rgba(" + Math.round(c.r * 255) + "," + Math.round(c.g * 255) + "," + Math.round(c.b * 255) + "," + (c.a !== undefined ? Math.round(c.a * 100) / 100 : 1) + ")";
+          var prefix = eff.type === "INNER_SHADOW" ? "inset " : "";
+          shadows.push(prefix + (eff.offset ? eff.offset.x : 0) + "px " + (eff.offset ? eff.offset.y : 0) + "px " + (eff.radius || 0) + "px " + (eff.spread || 0) + "px " + rgba);
+        }
+      }
+      if (shadows.length) detail.boxShadow = shadows.join(", ");
+    }
+  } catch(e) {}
+
+  // Layout / padding
+  try {
+    if (node.layoutMode && node.layoutMode !== "NONE") {
+      var alignMap = { "MIN": "flex-start", "CENTER": "center", "MAX": "flex-end", "SPACE_BETWEEN": "space-between" };
+      detail.css = {
+        display: "flex",
+        flexDirection: node.layoutMode === "HORIZONTAL" ? "row" : "column",
+        gap: node.itemSpacing + "px",
+        alignItems: alignMap[node.counterAxisAlignItems] || node.counterAxisAlignItems,
+        justifyContent: alignMap[node.primaryAxisAlignItems] || node.primaryAxisAlignItems,
+        padding: node.paddingTop + "px " + node.paddingRight + "px " + node.paddingBottom + "px " + node.paddingLeft + "px",
+      };
+    }
+  } catch(e) {}
+
+  // Text properties
+  if (node.type === "TEXT") {
+    try {
+      detail.content = node.characters;
+      detail.color = getFillHex(node);
+      detail.fontSize = node.fontSize + "px";
+      detail.fontFamily = node.fontName ? node.fontName.family : null;
+      detail.fontWeight = node.fontName ? node.fontName.style : null;
+      if (node.lineHeight) {
+        if (node.lineHeight.unit === "AUTO") detail.lineHeight = "normal";
+        else if (node.lineHeight.unit === "PERCENT") detail.lineHeight = Math.round(node.lineHeight.value) + "%";
+        else detail.lineHeight = node.lineHeight.value + "px";
+      }
+      if (node.letterSpacing && node.letterSpacing.value !== 0) detail.letterSpacing = node.letterSpacing.value + "px";
+      detail.textAlign = node.textAlignHorizontal ? node.textAlignHorizontal.toLowerCase() : null;
+    } catch(e) { try { detail.content = node.characters; } catch(e2) {} }
+  }
+
+  // Bound variables
+  try {
+    if (node.boundVariables) {
+      var bv = {};
+      var bvKeys = Object.keys(node.boundVariables);
+      for (var bvi = 0; bvi < bvKeys.length; bvi++) {
+        var bvk = bvKeys[bvi];
+        var binding = node.boundVariables[bvk];
+        if (binding) {
+          if (Array.isArray(binding)) bv[bvk] = binding.map(function(b) { return b ? b.id : null; });
+          else bv[bvk] = binding.id || null;
+        }
+      }
+      if (Object.keys(bv).length > 0) detail.boundVariables = bv;
+    }
+  } catch(e) {}
+
+  // Children count + text content summary
+  if ("children" in node) {
+    detail.childCount = node.children.length;
+    var texts = collectTextContent(node, 20);
+    if (texts.length) detail.textContent = texts;
+    var icons = collectIconNames(node, 10);
+    if (icons.length) detail.iconNames = icons;
+  }
+
+  return detail;
+};
+
+handlers.get_styles = async function() {
+  var paintStyles = await figma.getLocalPaintStylesAsync();
+  var textStyles = await figma.getLocalTextStylesAsync();
+  var effectStyles = await figma.getLocalEffectStylesAsync();
+  var gridStyles = await figma.getLocalGridStylesAsync();
+
+  return {
+    paintStyles: paintStyles.map(function(s) {
+      var paints = s.paints || [];
+      var hex = null;
+      if (paints.length > 0 && paints[0].type === "SOLID") {
+        hex = rgbToHex(paints[0].color);
+      }
+      return { id: s.id, name: s.name, hex: hex, type: "PAINT" };
+    }),
+    textStyles: textStyles.map(function(s) {
+      return {
+        id: s.id, name: s.name, type: "TEXT",
+        fontSize: s.fontSize,
+        fontFamily: s.fontName ? s.fontName.family : null,
+        fontWeight: s.fontName ? s.fontName.style : null,
+        lineHeight: s.lineHeight ? s.lineHeight.value : null,
+        letterSpacing: s.letterSpacing ? s.letterSpacing.value : null,
+      };
+    }),
+    effectStyles: effectStyles.map(function(s) {
+      return { id: s.id, name: s.name, type: "EFFECT", effects: s.effects.length };
+    }),
+    gridStyles: gridStyles.map(function(s) {
+      return { id: s.id, name: s.name, type: "GRID" };
+    }),
+  };
+};
+
+// get_local_components — enhanced component listing with descriptions and properties
+handlers.get_local_components = async function() {
+  await figma.loadAllPagesAsync();
+  var comps = figma.root.findAllWithCriteria({ types: ["COMPONENT"] });
+  var sets = figma.root.findAllWithCriteria({ types: ["COMPONENT_SET"] });
+
+  return {
+    components: comps.map(function(c) {
+      var info = {
+        id: c.id, name: c.name, key: c.key || null,
+        description: c.description || "",
+        width: Math.round(c.width), height: Math.round(c.height),
+        page: c.parent ? (function findPage(n) {
+          while (n && n.type !== "PAGE") n = n.parent;
+          return n ? n.name : null;
+        })(c) : null,
+      };
+      // Component properties (variant props)
+      try {
+        if (c.componentPropertyDefinitions) {
+          var defs = c.componentPropertyDefinitions;
+          var props = {};
+          for (var key in defs) {
+            if (Object.prototype.hasOwnProperty.call(defs, key)) {
+              props[key] = { type: defs[key].type, defaultValue: defs[key].defaultValue };
+              if (defs[key].variantOptions) props[key].options = defs[key].variantOptions;
+            }
+          }
+          info.properties = props;
+        }
+      } catch(e) { /* skip properties */ }
+      return info;
+    }),
+    componentSets: sets.map(function(s) {
+      return {
+        id: s.id, name: s.name, key: s.key || null,
+        description: s.description || "",
+        variantCount: s.children ? s.children.length : 0,
+      };
+    }),
+    total: comps.length + sets.length,
+  };
+};
+
+// get_viewport — current viewport position and zoom
+handlers.get_viewport = async function() {
+  var vp = figma.viewport;
+  return {
+    center: { x: Math.round(vp.center.x), y: Math.round(vp.center.y) },
+    zoom: vp.zoom,
+    bounds: vp.bounds ? {
+      x: Math.round(vp.bounds.x), y: Math.round(vp.bounds.y),
+      width: Math.round(vp.bounds.width), height: Math.round(vp.bounds.height),
+    } : null,
+  };
+};
+
+// set_viewport — navigate to specific area
+handlers.set_viewport = async function(params) {
+  if (params.nodeId || params.nodeName) {
+    // Zoom to fit a specific node
+    var node = params.nodeId ? findNodeById(params.nodeId) : findNodeByName(params.nodeName);
+    if (!node) throw new Error("Node not found for viewport navigation");
+    figma.viewport.scrollAndZoomIntoView([node]);
+    return { scrolledTo: node.id, name: node.name };
+  }
+  if (params.center) {
+    figma.viewport.center = { x: params.center.x, y: params.center.y };
+  }
+  if (params.zoom !== undefined) {
+    figma.viewport.zoom = params.zoom;
+  }
+  return {
+    center: { x: Math.round(figma.viewport.center.x), y: Math.round(figma.viewport.center.y) },
+    zoom: figma.viewport.zoom,
+  };
+};
+
+// get_variables — read Figma local variables (Design Tokens)
+handlers.get_variables = async function() {
+  var collections = [];
+  try {
+    var localCollections = await figma.variables.getLocalVariableCollectionsAsync();
+    for (var ci = 0; ci < localCollections.length; ci++) {
+      var col = localCollections[ci];
+      var variables = [];
+      for (var vi = 0; vi < col.variableIds.length; vi++) {
+        var v = await figma.variables.getVariableByIdAsync(col.variableIds[vi]);
+        if (!v) continue;
+        var values = {};
+        for (var modeId in v.valuesByMode) {
+          if (Object.prototype.hasOwnProperty.call(v.valuesByMode, modeId)) {
+            var val = v.valuesByMode[modeId];
+            // Convert color values to hex
+            if (val && typeof val === "object" && "r" in val && "g" in val && "b" in val) {
+              values[modeId] = rgbToHex(val);
+            } else {
+              values[modeId] = val;
+            }
+          }
+        }
+        variables.push({
+          id: v.id, name: v.name,
+          resolvedType: v.resolvedType,
+          values: values,
+          description: v.description || "",
+        });
+      }
+      collections.push({
+        id: col.id, name: col.name,
+        modes: col.modes.map(function(m) { return { id: m.modeId, name: m.name }; }),
+        variables: variables,
+      });
+    }
+  } catch(e) {
+    return { error: "Variables API not available: " + e.message, collections: [] };
+  }
+  return { collections: collections };
+};
+
+// ─── DESIGN TOKEN OPERATIONS (v1.7.0) ───────────────────────────────────────
+
+// createVariableCollection — create a new variable collection
+handlers.createVariableCollection = async function(params) {
+  var name = params.name;
+  if (!name) throw new Error("Collection name is required");
+
+  var collection = figma.variables.createVariableCollection(name);
+  return {
+    id: collection.id,
+    name: collection.name,
+    modes: collection.modes.map(function(m) { return { id: m.modeId, name: m.name }; }),
+  };
+};
+
+// createVariable — create a variable in a collection
+// Supports COLOR, FLOAT, STRING, BOOLEAN
+handlers.createVariable = async function(params) {
+  var name = params.name;
+  var collectionId = params.collectionId;
+  var resolvedType = params.resolvedType || "COLOR";
+  var value = params.value;
+
+  if (!name) throw new Error("Variable name is required");
+  if (!collectionId) throw new Error("collectionId is required");
+
+  // Find collection
+  var collections = await figma.variables.getLocalVariableCollectionsAsync();
+  var collection = null;
+  for (var i = 0; i < collections.length; i++) {
+    if (collections[i].id === collectionId || collections[i].name === collectionId) {
+      collection = collections[i];
+      break;
+    }
+  }
+  if (!collection) throw new Error("Collection not found: " + collectionId);
+
+  var variable = figma.variables.createVariable(name, collection, resolvedType);
+
+  // Set value for default mode
+  var modeId = collection.modes[0].modeId;
+  if (resolvedType === "COLOR" && typeof value === "string") {
+    // Convert hex to RGBA
+    var rgb = hexToRgb(value);
+    variable.setValueForMode(modeId, { r: rgb.r, g: rgb.g, b: rgb.b, a: 1 });
+  } else if (value !== undefined) {
+    variable.setValueForMode(modeId, value);
+  }
+
+  return {
+    id: variable.id,
+    name: variable.name,
+    resolvedType: variable.resolvedType,
+    collectionId: collection.id,
+  };
+};
+
+// applyVariable — bind a variable to a node property (fill, stroke, etc.)
+handlers.applyVariable = async function(params) {
+  var nodeId = params.nodeId || params.id;
+  var variableId = params.variableId;
+  var variableName = params.variableName;
+  var field = params.field || "fill"; // fill, stroke, opacity, cornerRadius, etc.
+
+  if (!nodeId) throw new Error("nodeId is required");
+  if (!variableId && !variableName) throw new Error("variableId or variableName is required");
+
+  var node = findNodeById(nodeId);
+  if (!node) throw new Error("Node not found: " + nodeId);
+
+  // Find variable by ID or name
+  var variable = null;
+  if (variableId) {
+    variable = await figma.variables.getVariableByIdAsync(variableId);
+  }
+  if (!variable && variableName) {
+    var allCollections = await figma.variables.getLocalVariableCollectionsAsync();
+    for (var ci = 0; ci < allCollections.length && !variable; ci++) {
+      var col = allCollections[ci];
+      for (var vi = 0; vi < col.variableIds.length && !variable; vi++) {
+        var v = await figma.variables.getVariableByIdAsync(col.variableIds[vi]);
+        if (v && v.name === variableName) variable = v;
+      }
+    }
+  }
+  if (!variable) throw new Error("Variable not found: " + (variableId || variableName));
+
+  // Map field names to Figma setBoundVariable fields
+  var fieldMap = {
+    "fill": "fills",
+    "fills": "fills",
+    "stroke": "strokes",
+    "strokes": "strokes",
+    "opacity": "opacity",
+    "cornerRadius": "topLeftRadius",
+    "width": "width",
+    "height": "height",
+  };
+
+  var figmaField = fieldMap[field] || field;
+
+  if (figmaField === "fills" || figmaField === "strokes") {
+    // For fills/strokes, bind variable to the first solid paint
+    var currentPaints = figmaField === "fills" ? node.fills : node.strokes;
+    if (!currentPaints || currentPaints.length === 0) {
+      // Create a solid fill first so we have something to bind to
+      currentPaints = [{ type: "SOLID", color: { r: 0, g: 0, b: 0 } }];
+    }
+    // Clone paints array (Figma requires setting the full array)
+    var paintsCopy = [];
+    for (var pi = 0; pi < currentPaints.length; pi++) {
+      paintsCopy.push(Object.assign({}, currentPaints[pi]));
+      if (currentPaints[pi].color) {
+        paintsCopy[pi].color = Object.assign({}, currentPaints[pi].color);
+      }
+    }
+    paintsCopy[0] = figma.variables.setBoundVariableForPaint(paintsCopy[0], "color", variable);
+    if (figmaField === "fills") node.fills = paintsCopy;
+    else node.strokes = paintsCopy;
+  } else {
+    node.setBoundVariable(figmaField, variable);
+  }
+
+  return {
+    nodeId: node.id,
+    nodeName: node.name,
+    field: field,
+    variableId: variable.id,
+    variableName: variable.name,
+  };
+};
+
+// createPaintStyle — create a reusable local paint style
+handlers.createPaintStyle = async function(params) {
+  var name = params.name;
+  var color = params.color; // hex string
+  var description = params.description || "";
+
+  if (!name) throw new Error("Style name is required");
+  if (!color) throw new Error("Color hex is required");
+
+  var style = figma.createPaintStyle();
+  style.name = name;
+  style.description = description;
+  style.paints = [{ type: "SOLID", color: hexToRgb(color) }];
+
+  return {
+    id: style.id,
+    name: style.name,
+    key: style.key,
+    color: color,
+  };
+};
+
+// createTextStyle — create a reusable local text style
+handlers.createTextStyle = async function(params) {
+  var name = params.name;
+  var fontFamily = params.fontFamily || "Inter";
+  var fontWeight = params.fontWeight || "Regular";
+  var fontSize = params.fontSize || 14;
+  var lineHeight = params.lineHeight;
+  var letterSpacing = params.letterSpacing;
+  var description = params.description || "";
+
+  if (!name) throw new Error("Style name is required");
+
+  var style = figma.createTextStyle();
+  style.name = name;
+  style.description = description;
+
+  // Map weight names to Figma font style strings
+  var weightMap = FONT_STYLE_MAP;
+  var figmaStyle = weightMap[fontWeight] || fontWeight;
+
+  await figma.loadFontAsync({ family: fontFamily, style: figmaStyle });
+  style.fontName = { family: fontFamily, style: figmaStyle };
+  style.fontSize = fontSize;
+
+  if (lineHeight !== undefined) {
+    if (lineHeight === "auto") {
+      style.lineHeight = { unit: "AUTO" };
+    } else if (typeof lineHeight === "string" && lineHeight.indexOf("%") !== -1) {
+      style.lineHeight = { unit: "PERCENT", value: parseFloat(lineHeight) };
+    } else {
+      style.lineHeight = { unit: "PIXELS", value: Number(lineHeight) };
+    }
+  }
+
+  if (letterSpacing !== undefined) {
+    style.letterSpacing = { unit: "PIXELS", value: Number(letterSpacing) };
+  }
+
+  return {
+    id: style.id,
+    name: style.name,
+    key: style.key,
+    fontFamily: fontFamily,
+    fontWeight: fontWeight,
+    fontSize: fontSize,
+  };
+};
+
+// createComponent — convert an existing frame/group into a reusable component
+handlers.createComponent = async function(params) {
+  var nodeId = params.nodeId || params.id;
+  var name = params.name;
+
+  if (!nodeId) throw new Error("nodeId of the frame to convert is required");
+
+  var node = findNodeById(nodeId);
+  if (!node) throw new Error("Node not found: " + nodeId);
+
+  var component;
+  if (node.type === "FRAME" || node.type === "GROUP") {
+    component = figma.createComponentFromNode(node);
+  } else {
+    throw new Error("Can only convert FRAME or GROUP to component, got: " + node.type);
+  }
+
+  if (name) component.name = name;
+
+  return {
+    id: component.id,
+    name: component.name,
+    key: component.key,
+    width: Math.round(component.width),
+    height: Math.round(component.height),
+  };
+};
+
+// modifyVariable — change the value of an existing variable
+handlers.modifyVariable = async function(params) {
+  var variableId = params.variableId;
+  var variableName = params.variableName;
+  var value = params.value; // hex color string for COLOR type, number for FLOAT
+
+  if (!variableId && !variableName) throw new Error("variableId or variableName is required");
+  if (value === undefined) throw new Error("value is required");
+
+  // Find variable
+  var variable = null;
+  if (variableId) {
+    variable = await figma.variables.getVariableByIdAsync(variableId);
+  }
+  if (!variable && variableName) {
+    var allCollections = await figma.variables.getLocalVariableCollectionsAsync();
+    for (var ci = 0; ci < allCollections.length && !variable; ci++) {
+      var col = allCollections[ci];
+      for (var vi = 0; vi < col.variableIds.length && !variable; vi++) {
+        var v = await figma.variables.getVariableByIdAsync(col.variableIds[vi]);
+        if (v && v.name === variableName) variable = v;
+      }
+    }
+  }
+  if (!variable) throw new Error("Variable not found: " + (variableId || variableName));
+
+  // Get the collection to find mode ID
+  var collection = await figma.variables.getVariableCollectionByIdAsync(variable.variableCollectionId);
+  var modeId = collection.modes[0].modeId;
+
+  // Set value based on type
+  if (variable.resolvedType === "COLOR") {
+    var hex = value.replace("#", "");
+    var r = parseInt(hex.substring(0, 2), 16) / 255;
+    var g = parseInt(hex.substring(2, 4), 16) / 255;
+    var b = parseInt(hex.substring(4, 6), 16) / 255;
+    variable.setValueForMode(modeId, { r: r, g: g, b: b, a: 1 });
+  } else if (variable.resolvedType === "FLOAT") {
+    variable.setValueForMode(modeId, Number(value));
+  } else if (variable.resolvedType === "STRING") {
+    variable.setValueForMode(modeId, String(value));
+  } else if (variable.resolvedType === "BOOLEAN") {
+    variable.setValueForMode(modeId, Boolean(value));
+  }
+
+  return {
+    id: variable.id,
+    name: variable.name,
+    resolvedType: variable.resolvedType,
+    newValue: value,
+  };
+};
+
+// setupDesignTokens — bootstrap a complete design token system in one call
+// Creates variable collection + all color/spacing variables if they don't exist
+// Idempotent: skips existing variables, only adds missing ones
+handlers.setupDesignTokens = async function(params) {
+  var collectionName = params.collectionName || "Design Tokens";
+  var colors = params.colors || {};   // { "accent": "#3B82F6", "bg-base": "#08090E", ... }
+  var numbers = params.numbers || {}; // { "spacing-sm": 8, "radius-md": 12, ... }
+
+  // Find or create collection
+  var collection = null;
+  var allCollections = await figma.variables.getLocalVariableCollectionsAsync();
+  for (var ci = 0; ci < allCollections.length; ci++) {
+    if (allCollections[ci].name === collectionName) {
+      collection = allCollections[ci];
+      break;
+    }
+  }
+  if (!collection) {
+    collection = figma.variables.createVariableCollection(collectionName);
+  }
+
+  // Read existing variables in this collection
+  var existing = {};
+  for (var vi = 0; vi < collection.variableIds.length; vi++) {
+    var v = await figma.variables.getVariableByIdAsync(collection.variableIds[vi]);
+    if (v) existing[v.name] = v;
+  }
+
+  var modeId = collection.modes[0].modeId;
+  var created = [];
+  var skipped = [];
+
+  // Create color variables
+  var colorNames = Object.keys(colors);
+  for (var i = 0; i < colorNames.length; i++) {
+    var name = colorNames[i];
+    var hex = colors[name].replace("#", "");
+    var r = parseInt(hex.substring(0, 2), 16) / 255;
+    var g = parseInt(hex.substring(2, 4), 16) / 255;
+    var b = parseInt(hex.substring(4, 6), 16) / 255;
+
+    if (existing[name]) {
+      // Update existing variable value
+      existing[name].setValueForMode(modeId, { r: r, g: g, b: b, a: 1 });
+      skipped.push(name);
+    } else {
+      var cv = figma.variables.createVariable(name, collection, "COLOR");
+      cv.setValueForMode(modeId, { r: r, g: g, b: b, a: 1 });
+      created.push({ name: name, id: cv.id, type: "COLOR" });
+    }
+  }
+
+  // Create number variables (spacing, radius, etc.)
+  var numNames = Object.keys(numbers);
+  for (var i = 0; i < numNames.length; i++) {
+    var name = numNames[i];
+    if (existing[name]) {
+      existing[name].setValueForMode(modeId, Number(numbers[name]));
+      skipped.push(name);
+    } else {
+      var nv = figma.variables.createVariable(name, collection, "FLOAT");
+      nv.setValueForMode(modeId, Number(numbers[name]));
+      created.push({ name: name, id: nv.id, type: "FLOAT" });
+    }
+  }
+
+  return {
+    collectionId: collection.id,
+    collectionName: collection.name,
+    created: created,
+    updated: skipped,
+    totalVariables: collection.variableIds.length,
+  };
+};
+
+// ─── NEW WRITE OPERATIONS ────────────────────────────────────────────────────
+
+// clone — duplicate a node
+handlers.clone = async function(params) {
+  var node = resolveNode(params);
+  if (!node) throw new Error("Node not found for cloning");
+  var clone = node.clone();
+  if (params.x !== undefined) clone.x = params.x;
+  if (params.y !== undefined) clone.y = params.y;
+  if (params.name) clone.name = params.name;
+  if (params.parentId) {
+    var parent = findNodeById(params.parentId);
+    if (parent) parent.appendChild(clone);
+  }
+  return nodeToInfo(clone);
+};
+
+// group — group selected or specified nodes
+handlers.group = async function(params) {
+  var nodeIds = params.nodeIds || [];
+  var nodes = [];
+  for (var i = 0; i < nodeIds.length; i++) {
+    var n = findNodeById(nodeIds[i]);
+    if (n) nodes.push(n);
+  }
+  if (nodes.length < 1) throw new Error("Need at least 1 node to group");
+  var parent = nodes[0].parent || figma.currentPage;
+  var group = figma.group(nodes, parent);
+  if (params.name) group.name = params.name;
+  return nodeToInfo(group);
+};
+
+// ungroup — ungroup a group node
+handlers.ungroup = async function(params) {
+  var node = resolveNode(params);
+  if (!node) throw new Error("Node not found for ungrouping");
+  if (node.type !== "GROUP" && node.type !== "FRAME") throw new Error("Node must be GROUP or FRAME to ungroup");
+  var children = [];
+  var parent = node.parent || figma.currentPage;
+  var nodeChildren = [].concat(node.children);
+  for (var i = 0; i < nodeChildren.length; i++) {
+    parent.appendChild(nodeChildren[i]);
+    children.push(nodeToInfo(nodeChildren[i]));
+  }
+  node.remove();
+  return { ungrouped: children };
+};
+
+// flatten — flatten a node (merge vectors)
+handlers.flatten = async function(params) {
+  var node = resolveNode(params);
+  if (!node) throw new Error("Node not found for flatten");
+  var flat = figma.flatten([node]);
+  return nodeToInfo(flat);
+};
+
+// resize — resize a node with constraints
+handlers.resize = async function(params) {
+  var node = resolveNode(params);
+  if (!node) throw new Error("Node not found for resize");
+  if (!("resize" in node)) throw new Error("Node type does not support resize");
+  var w = params.width !== undefined ? params.width : node.width;
+  var h = params.height !== undefined ? params.height : node.height;
+  node.resize(w, h);
+  return nodeToInfo(node);
+};
+
+// set_selection — programmatically select nodes
+handlers.set_selection = async function(params) {
+  var nodeIds = params.nodeIds || [];
+  var nodes = [];
+  for (var i = 0; i < nodeIds.length; i++) {
+    var n = findNodeById(nodeIds[i]);
+    if (n) nodes.push(n);
+  }
+  figma.currentPage.selection = nodes;
+  return { selected: nodes.map(nodeToInfo) };
+};
+
+// batch — execute multiple operations in one call
+handlers.batch = async function(params) {
+  var operations = params.operations || [];
+  if (!operations.length) throw new Error("No operations provided");
+  if (operations.length > 50) throw new Error("Max 50 operations per batch");
+
+  var results = [];
+  for (var i = 0; i < operations.length; i++) {
+    var op = operations[i];
+    var handler = handlers[op.operation];
+    if (!handler) {
+      results.push({ index: i, operation: op.operation, success: false, error: "Unknown operation" });
+      continue;
+    }
+    try {
+      var data = await handler(op.params || {});
+      results.push({ index: i, operation: op.operation, success: true, data: data });
+    } catch(e) {
+      results.push({ index: i, operation: op.operation, success: false, error: e.message });
+    }
+  }
+  return { results: results, total: operations.length, succeeded: results.filter(function(r) { return r.success; }).length };
+};
+
+// ─── DISPATCHER ───────────────────────────────────────────────────────────────
+
+// Sanitize data before postMessage — remove Symbol values (e.g. figma.mixed)
+// that cannot be serialized via structured clone / JSON
+function sanitizeForPostMessage(obj) {
+  if (obj === null || obj === undefined) return obj;
+  if (typeof obj === "symbol") return "mixed";
+  if (typeof obj === "number" || typeof obj === "string" || typeof obj === "boolean") return obj;
+  if (Array.isArray(obj)) return obj.map(sanitizeForPostMessage);
+  if (typeof obj === "object") {
+    var clean = {};
+    for (var key in obj) {
+      if (Object.prototype.hasOwnProperty.call(obj, key)) {
+        var val = obj[key];
+        if (typeof val === "symbol") {
+          clean[key] = "mixed";
+        } else {
+          clean[key] = sanitizeForPostMessage(val);
+        }
+      }
+    }
+    return clean;
+  }
+  return obj;
+}
+
+figma.ui.onmessage = async (request) => {
+  const { id, operation, params } = request;
+  const handler = handlers[operation];
+
+  if (!handler) {
+    figma.ui.postMessage({
+      id, operation, success: false,
+      error: `Unknown operation "${operation}". Available: ${Object.keys(handlers).join(", ")}`,
+    });
+    return;
+  }
+
+  try {
+    var data = await handler(params || {});
+    figma.ui.postMessage({ id: id, operation: operation, success: true, data: sanitizeForPostMessage(data) });
+  } catch (err) {
+    var errMsg = "[dispatch:" + operation + "] " + (err && err.message ? err.message : String(err));
+    figma.ui.postMessage({ id: id, operation: operation, success: false, error: errMsg });
+  }
+};

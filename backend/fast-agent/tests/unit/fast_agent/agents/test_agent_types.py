@@ -1,0 +1,313 @@
+"""
+Unit tests for agent types and their interactions with the interactive prompt.
+"""
+
+from dataclasses import dataclass
+from typing import Any, cast
+
+import pytest
+
+from fast_agent.agents import McpAgent
+from fast_agent.agents.agent_types import AgentConfig, AgentType
+from fast_agent.agents.smart_agent import (
+    SmartAgent,
+    _apply_runtime_mcp_connections,
+    _resolve_default_agent_name,
+)
+from fast_agent.config import MCPServerSettings, MCPSettings, Settings
+from fast_agent.context import Context
+from fast_agent.core.exceptions import AgentConfigError
+from fast_agent.llm.fastagent_llm import FastAgentLLM
+from fast_agent.llm.provider_types import Provider
+from fast_agent.mcp_server_registry import ServerRegistry
+from fast_agent.types import RequestParams
+
+
+def test_agent_type_default():
+    """Test that agent_type defaults to AgentType.BASIC.value"""
+    agent = McpAgent(config=AgentConfig(name="test_agent"))
+    assert agent.agent_type == AgentType.BASIC
+
+
+def test_agent_type_smart_enum():
+    assert AgentType.SMART.value == "smart"
+
+
+def test_smart_agent_type():
+    agent = SmartAgent(config=AgentConfig(name="smart_agent"))
+    assert agent.agent_type == AgentType.SMART
+
+
+def test_instruction_propagates_to_default_request_params():
+    """
+    Test that AgentConfig.instruction is propagated to
+    default_request_params.systemPrompt when both are provided.
+
+    This reproduces the bug where the instruction is lost when
+    a user provides their own default_request_params.
+    """
+    # Create RequestParams with custom settings but no systemPrompt
+    request_params = RequestParams(
+        model="sonnet",
+        temperature=0.7,
+        maxTokens=32768
+    )
+
+    # Verify systemPrompt is not set initially
+    assert not hasattr(request_params, 'systemPrompt') or request_params.systemPrompt is None
+
+    # Create AgentConfig with both instruction and default_request_params
+    instruction = "You are a helpful assistant specialized in testing."
+    config = AgentConfig(
+        name="my_agent",
+        instruction=instruction,
+        default_request_params=request_params,
+        model="sonnet"
+    )
+
+    # The instruction should be propagated to default_request_params.systemPrompt
+    assert config.default_request_params is not None
+    assert config.default_request_params.systemPrompt == instruction, (
+        f"Expected systemPrompt to be '{instruction}', "
+        f"but got {config.default_request_params.systemPrompt}"
+    )
+
+
+class _StubProviderManagedLLM(FastAgentLLM):
+    def __init__(self, provider: Provider = Provider.ANTHROPIC) -> None:
+        super().__init__(provider=provider)
+
+    async def _apply_prompt_provider_specific(
+        self,
+        multipart_messages,
+        request_params=None,
+        tools=None,
+        is_template: bool = False,
+    ):
+        del request_params, tools, is_template
+        return multipart_messages[-1]
+
+    def _convert_extended_messages_to_provider(self, messages):
+        del messages
+        return []
+
+
+@pytest.mark.asyncio
+async def test_provider_managed_servers_remain_visible_without_local_aggregator_attach() -> None:
+    server_settings = {
+        "stripe": MCPServerSettings(
+            name="stripe",
+            management="provider",
+            transport="http",
+            url="https://mcp.stripe.com",
+        ),
+        "filesystem": MCPServerSettings(
+            name="filesystem",
+            command="npx",
+            args=["@modelcontextprotocol/server-filesystem"],
+        ),
+    }
+    server_registry = ServerRegistry()
+    server_registry.registry = server_settings
+    context = Context(
+        config=Settings(
+            mcp=MCPSettings(
+                servers=server_settings,
+            )
+        ),
+        server_registry=server_registry,
+    )
+    agent = McpAgent(
+        config=AgentConfig(name="billing", servers=["stripe", "filesystem"]),
+        context=context,
+        connection_persistence=False,
+    )
+
+    assert agent.aggregator.server_names == ["filesystem"]
+    assert agent.list_attached_mcp_servers() == ["stripe"]
+    assert await agent.list_servers() == ["filesystem", "stripe"]
+
+    agent.aggregator.initialized = True
+    status_map = await agent.get_server_status()
+    assert set(status_map) == {"filesystem", "stripe"}
+    assert status_map["stripe"].is_connected is True
+    assert status_map["stripe"].transport == "http"
+
+
+def test_provider_managed_servers_attach_state_to_supported_llm() -> None:
+    context = Context(
+        config=Settings(
+            mcp=MCPSettings(
+                servers={
+                    "stripe": MCPServerSettings(
+                        name="stripe",
+                        management="provider",
+                        transport="http",
+                        url="https://mcp.stripe.com",
+                    )
+                }
+            )
+        )
+    )
+    agent = McpAgent(
+        config=AgentConfig(name="billing", servers=["stripe"]),
+        context=context,
+    )
+    llm = _StubProviderManagedLLM(provider=Provider.ANTHROPIC)
+
+    agent._on_llm_attached(llm)
+
+    assert llm.provider_managed_mcp_state.server_names == ("stripe",)
+
+
+def test_provider_managed_servers_reject_codexresponses_llm() -> None:
+    context = Context(
+        config=Settings(
+            mcp=MCPSettings(
+                servers={
+                    "stripe": MCPServerSettings(
+                        name="stripe",
+                        management="provider",
+                        transport="http",
+                        url="https://mcp.stripe.com",
+                    )
+                }
+            )
+        )
+    )
+    agent = McpAgent(
+        config=AgentConfig(name="billing", servers=["stripe"]),
+        context=context,
+    )
+    llm = _StubProviderManagedLLM(provider=Provider.CODEX_RESPONSES)
+
+    with pytest.raises(AgentConfigError, match="OpenAI Responses provider"):
+        agent._on_llm_attached(llm)
+
+
+def test_instruction_takes_precedence_over_systemPrompt():
+    """
+    Test that AgentConfig.instruction takes precedence over
+    default_request_params.systemPrompt when both are provided.
+
+    This ensures that the explicit instruction parameter on AgentConfig
+    overrides any systemPrompt already set in the RequestParams.
+    """
+    # Create RequestParams with a systemPrompt already set
+    original_system_prompt = "You are a generic assistant from RequestParams."
+    request_params = RequestParams(
+        model="sonnet",
+        temperature=0.7,
+        maxTokens=32768,
+        systemPrompt=original_system_prompt
+    )
+
+    # Verify systemPrompt is set initially
+    assert request_params.systemPrompt == original_system_prompt
+
+    # Create AgentConfig with BOTH instruction AND default_request_params with systemPrompt
+    instruction = "You are a specialized assistant from AgentConfig instruction."
+    config = AgentConfig(
+        name="my_agent",
+        instruction=instruction,
+        default_request_params=request_params,
+        model="sonnet"
+    )
+
+    # The AgentConfig.instruction should take precedence over systemPrompt in RequestParams
+    assert config.default_request_params is not None
+    assert config.default_request_params.systemPrompt == instruction, (
+        f"Expected AgentConfig.instruction ('{instruction}') to override "
+        f"RequestParams.systemPrompt ('{original_system_prompt}'), "
+        f"but got {config.default_request_params.systemPrompt}"
+    )
+
+
+@dataclass
+class _FakeAttachResult:
+    tools_added: list[str]
+    prompts_added: list[str]
+
+
+class _FakeMcpAgent:
+    def __init__(self, *, default: bool = False, fail: bool = False) -> None:
+        self.config = AgentConfig(name="fake", default=default)
+        self._fail = fail
+        self.attached: list[str] = []
+
+    async def attach_mcp_server(self, *, server_name: str, server_config=None, options=None):
+        del server_config, options
+        if self._fail:
+            raise RuntimeError("boom")
+        self.attached.append(server_name)
+        return _FakeAttachResult(tools_added=[], prompts_added=[])
+
+    async def detach_mcp_server(self, server_name: str):
+        detached = server_name in self.attached
+        if detached:
+            self.attached.remove(server_name)
+
+        @dataclass
+        class _DetachResult:
+            detached: bool
+            tools_removed: list[str]
+            prompts_removed: list[str]
+
+        return _DetachResult(detached=detached, tools_removed=[], prompts_removed=[])
+
+    def list_attached_mcp_servers(self) -> list[str]:
+        return list(self.attached)
+
+
+def test_resolve_default_agent_name_prefers_non_tool_default() -> None:
+    tool_default = _FakeMcpAgent(default=True)
+    non_tool_default = _FakeMcpAgent(default=True)
+    agents = {
+        "tool": tool_default,
+        "main": non_tool_default,
+    }
+
+    resolved = _resolve_default_agent_name(
+        cast("Any", agents),
+        tool_only_agents={"tool"},
+    )
+    assert resolved == "main"
+
+
+@pytest.mark.asyncio
+async def test_apply_runtime_mcp_connections_attaches_servers() -> None:
+    agent = _FakeMcpAgent(default=True)
+    summary = await _apply_runtime_mcp_connections(
+        context=None,
+        agents_map=cast("Any", {"main": agent}),
+        target_agent_name="main",
+        mcp_connect=["npx demo-server --name demo"],
+    )
+
+    assert summary.connected == ["demo"]
+    assert summary.warnings == []
+    assert agent.attached == ["demo"]
+
+
+@pytest.mark.asyncio
+async def test_apply_runtime_mcp_connections_raises_on_connect_error() -> None:
+    failing = _FakeMcpAgent(default=True, fail=True)
+    with pytest.raises(AgentConfigError, match="Failed to connect MCP server"):
+        await _apply_runtime_mcp_connections(
+            context=None,
+            agents_map=cast("Any", {"main": failing}),
+            target_agent_name="main",
+            mcp_connect=["npx demo-server --name demo"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_runtime_mcp_connections_wraps_parse_errors() -> None:
+    agent = _FakeMcpAgent(default=True)
+    with pytest.raises(AgentConfigError, match="Failed to connect MCP server for smart tool call"):
+        await _apply_runtime_mcp_connections(
+            context=None,
+            agents_map=cast("Any", {"main": agent}),
+            target_agent_name="main",
+            mcp_connect=["npx demo-server --timeout 0"],
+        )

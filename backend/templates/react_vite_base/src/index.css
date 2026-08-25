@@ -1,0 +1,100 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 40 20% 98%;
+    --foreground: 224 71.4% 4.1%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 224 71.4% 4.1%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 224 71.4% 4.1%;
+
+    --primary: 36 38% 64%;
+    --primary-foreground: 210 20% 98%;
+
+    --secondary: 40 15% 94%;
+    --secondary-foreground: 220.9 39.3% 11%;
+
+    --muted: 220 14.3% 95.9%;
+    --muted-foreground: 220 8.9% 46.1%;
+
+    --accent: 24 100% 53%;
+    --accent-foreground: 220.9 39.3% 11%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 20% 98%;
+
+    --border: 220 13% 91%;
+    --input: 220 13% 91%;
+    --ring: 36 38% 64%;
+
+    --radius: 0.75rem;
+
+    /* Luxoria Luxury Tokens */
+    --lux-gold: #c5a880;
+    --lux-bronze: #d4af37;
+    --lux-obsidian: #090a0f;
+    --lux-ivory: #faf8f5;
+  }
+
+  .dark {
+    --background: 230 25% 4%;
+    --foreground: 210 20% 98%;
+
+    --card: 228 20% 7%;
+    --card-foreground: 210 20% 98%;
+
+    --popover: 228 20% 7%;
+    --popover-foreground: 210 20% 98%;
+
+    --primary: 36 38% 64%;
+    --primary-foreground: 224 71.4% 4.1%;
+
+    --secondary: 226 15% 12%;
+    --secondary-foreground: 210 20% 98%;
+
+    --muted: 226 15% 12%;
+    --muted-foreground: 217.9 10.6% 64.9%;
+
+    --accent: 24 100% 53%;
+    --accent-foreground: 210 20% 98%;
+
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 20% 98%;
+
+    --border: 226 15% 14%;
+    --input: 226 15% 14%;
+    --ring: 36 38% 64%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+.reveal {
+  opacity: 0;
+  transform: translateY(24px);
+  transition: opacity 0.85s cubic-bezier(0.16, 1, 0.3, 1), transform 0.85s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.reveal.active {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.glass-card {
+  background: hsl(var(--card) / 0.75);
+  backdrop-filter: blur(16px);
+  border: 1px solid hsl(var(--border) / 0.6);
+}

@@ -1,0 +1,19 @@
+{
+  "name": "Figma UI MCP Bridge",
+  "id": "1614927480683426278",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "documentAccess": "dynamic-page",
+  "editorType": ["figma", "dev"],
+  "networkAccess": {
+    "allowedDomains": [
+      "http://localhost:38451",
+      "http://localhost:38452",
+      "http://localhost:38453",
+      "http://localhost:38454",
+      "http://localhost:38455"
+    ],
+    "reasoning": "Plugin connects to bridge server on localhost. Multiple ports listed to support auto-port-finding."
+  }
+}

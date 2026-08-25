@@ -1,0 +1,1945 @@
+"""
+Spawn Progress Bridge — Cross-process forwarding of SpawnEvents to SSE.
+
+Architecture:
+  MCP subprocess (agent_spawner_server.py)
+  → connects to Unix domain socket (SPAWN_EVENT_SOCKET env var)
+  → sends SpawnEvents as JSON lines over socket
+
+  Main backend process (SpawnEventSocketServer + this module)
+  → receives events via socket
+  → pushes events into ProgressEventManager's SSE queue (chat-stream)
+  → persists events into agent_activities SQLite table
+  → broadcasts events via ActivityStreamManager (global SSE)
+  → upserts spawn_records SQLite table
+
+Also logs all events to the spawn_activity logger for ops/debugging.
+"""
+
+import asyncio
+import json
+import logging
+import os
+from typing import Any, Protocol
+
+logger = logging.getLogger("spawn_activity")
+
+_EMAIL_TOOL_NAMES = {"send_email", "email__send_email"}
+
+
+def _sanitize_tool_args_preview(tool_name: str, args_preview: str) -> str:
+    """Redact sensitive email body content before broadcasting over SSE."""
+    preview = (args_preview or "").strip()
+    if tool_name not in _EMAIL_TOOL_NAMES or not preview:
+        return preview[:60]
+
+    try:
+        parsed = json.loads(preview)
+        if isinstance(parsed, dict):
+            safe = {}
+            if parsed.get("to"):
+                safe["to"] = parsed["to"]
+            if parsed.get("cc"):
+                safe["cc"] = parsed["cc"]
+            if parsed.get("subject"):
+                safe["subject"] = str(parsed["subject"])[:40]
+            if "no_reply" in parsed:
+                safe["no_reply"] = parsed["no_reply"]
+            if "priority" in parsed:
+                safe["priority"] = parsed["priority"]
+            safe["content_redacted"] = True
+            return json.dumps(safe, ensure_ascii=False)[:60]
+    except (TypeError, json.JSONDecodeError):
+        pass
+
+    lowered = preview.lower()
+    body_idx = lowered.find("body=")
+    if body_idx >= 0:
+        safe_preview = preview[:body_idx].strip()
+        suffix = "content=[REDACTED]"
+        return f"{safe_preview} {suffix}".strip()[:60]
+
+    return "email payload [REDACTED]"[:60]
+
+
+
+
+def _sanitize_event_data(event_type_str: str, data: dict | None) -> dict:
+    """Return a copy of event data safe for UI-facing broadcast/persistence."""
+    safe_data = dict(data or {})
+    if event_type_str != "tool_call":
+        return safe_data
+
+    tool_name = safe_data.get("tool_name", "")
+    if tool_name not in _EMAIL_TOOL_NAMES:
+        return safe_data
+
+    preview = _sanitize_tool_args_preview(tool_name, safe_data.get("args_preview", ""))
+    if preview:
+        safe_data["args_preview"] = preview
+    else:
+        safe_data.pop("args_preview", None)
+    return safe_data
+
+class _ProgressManager(Protocol):
+    """Minimal interface for ProgressEventManager."""
+    def push(self, request_id: str, event_type: str, data: dict) -> None: ...
+
+
+# Map SpawnEvent.event → (SSE event_type, message_template)
+_EVENT_MAP = {
+    "started": ("spawn_started", "🚀 {agent_name} starting..."),
+    "mcp_connected": ("spawn_mcp", "📡 {agent_name}: {server_name} {status}"),
+    "thinking": ("spawn_thinking", "🤔 {agent_name} thinking..."),
+    "response": ("spawn_response", "💬 {agent_name} responded"),
+    "tool_call": ("spawn_tool_call", "🔧 {agent_name} calling {tool_name}"),
+    "tool_result": ("spawn_tool_done", "✅ {agent_name} completed {tool_name}"),
+    "result": ("spawn_result", "✅ {agent_name} finished ({duration_seconds:.0f}s)"),
+    "error": ("spawn_error", "❌ {agent_name} error: {error_msg}"),
+    "removed": ("spawn_removed", "🗑️ {agent_name} removed"),
+    "idle": ("spawn_idle", "💤 {agent_name} waiting for new task..."),
+    "resumed": ("spawn_resumed", "⚡ {agent_name} received new task"),
+    "agent_completed": ("spawn_agent_completed", "📋 {agent_name} completed — status: {status}"),
+    # Lifecycle hook events (from SpawnLifecycleHooks)
+    "lifecycle_pre_spawn": ("spawn_lifecycle", "⏳ {agent_name} preparing to spawn..."),
+    "lifecycle_spawn_registered": ("spawn_lifecycle", "📝 {agent_name} registered in registry"),
+    "lifecycle_process_started": ("spawn_lifecycle", "🔄 {agent_name} process started"),
+    "lifecycle_completed": ("spawn_lifecycle", "✅ {agent_name} completed"),
+    "lifecycle_error": ("spawn_lifecycle", "❌ {agent_name} lifecycle error"),
+    "lifecycle_cancelled": ("spawn_lifecycle", "🚫 {agent_name} cancelled"),
+    "lifecycle_pre_cleanup": ("spawn_lifecycle", "🧹 {agent_name} cleaning up..."),
+    "lifecycle_after_cleanup": ("agent_removed", "🗑️ {agent_name} removed"),
+    # Pause/Resume events (from PauseSignalHandler in subprocess).
+    # Four-event state machine — pausing/resuming are the transitional
+    # "request received" states (UI renders a spinner), paused/resumed
+    # are the terminal states emitted when the agent actually blocks/wakes.
+    "agent_pausing": ("agent_pausing", "⏸️ {agent_name} pausing…"),
+    "agent_paused": ("agent_paused", "⏸️ {agent_name} paused"),
+    "agent_resuming": ("agent_resuming", "▶️ {agent_name} resuming…"),
+    "agent_resumed": ("agent_resumed", "▶️ {agent_name} resumed"),
+    "token_usage": ("spawn_token_usage", "📊 {agent_name} token usage"),
+    "runtime_config": ("spawn_runtime_config", "⚙️ {agent_name} runtime config loaded"),
+    "mcp_status": ("spawn_mcp_status", "🔌 {agent_name} MCP: {status}"),
+    # Team-level lifecycle events
+    "team_spawned": ("team_spawned", "🏗️ Team {team_name} initialized"),
+    "team_member_spawned": ("team_member_spawned", "👤 {agent_name} ({role}) joined team {team_name}"),
+}
+
+
+class SpawnProgressBridge:
+    """Processes SpawnEvents received via Unix domain socket.
+
+    Events are received by SpawnEventSocketServer and forwarded here
+    for processing: SSE broadcast, DB persistence, token tracking.
+
+    Usage::
+
+        bridge = SpawnProgressBridge(progress_manager, registry_db=db)
+
+        # Socket server calls bridge.process_event(raw_line) for each event
+
+        # Before chat processing:
+        bridge.set_request_id(request_id)
+        # After chat processing:
+        bridge.set_request_id(None)
+    """
+
+    def __init__(self, progress_manager: _ProgressManager, registry_db=None):
+        self._pm = progress_manager
+        self._request_id: str | None = None
+        self._registry_db = registry_db
+        self._token_accumulators: dict[str, dict] = {}  # key → last-seen cumulative values
+        # Event-stream tables for team cycle notifications. Lazy-create
+        # via raw SQL (matches pattern in core/agent_registry_db.py) — kept
+        # local to this module since the bridge is the only consumer.
+        self._ensure_event_tables()
+
+    def set_request_id(self, request_id: str | None) -> None:
+        """Set the active chat request ID for SSE routing."""
+        self._request_id = request_id
+
+    def process_event(self, raw_line: str) -> None:
+        """Process a raw JSON line event from the socket server.
+
+        This is the public entry point called by SpawnEventSocketServer.
+        """
+        self._process_event_line(raw_line)
+
+    def _process_event_line(self, line: str) -> None:
+        """Parse a JSON line and forward to SSE."""
+        try:
+            event_data = json.loads(line)
+        except json.JSONDecodeError:
+            return
+
+        agent_name = event_data.get("agent_name", "agent")
+        event_type_str = event_data.get("event_type", "")
+        data = event_data.get("data", {})
+        run_id = event_data.get("run_id") or data.get("run_id")
+
+        # 1. Always log to spawn_activity logger
+        logger.info(
+            "[SPAWN] [%s] %s | %s",
+            agent_name,
+            event_type_str,
+            json.dumps(data, ensure_ascii=False, default=str)[:500],
+        )
+
+        # 1b. message_turn — forward directly to activity stream after trimming
+        # large content blocks. Source-of-truth shape comes from the subprocess
+        # ``child_agent.message_history``; we don't synthesize anything here.
+        if event_type_str == "message_turn":
+            self._forward_message_turn(agent_name, data, event_data)
+            return
+
+        # 2. Persist to agent_activities DB (always, regardless of active request).
+        # Kept for the legacy AgentDetail "Activity" tab and audit log; no
+        # current monitor UI reads it as primary source.
+        self._persist_activity(agent_name, event_type_str, data, event_data)
+
+        # 3. Broadcast via ActivityStreamManager (global SSE for monitoring).
+        # tool_call / tool_result / response are intentionally NOT broadcast —
+        # the message_turn channel (handled at top of this function) is the
+        # canonical source for those. We still broadcast lifecycle events
+        # (started/idle/error/agent_paused/agent_resumed/...) and "thinking"
+        # so the running-status pulse appears between turns.
+        if event_type_str not in {"tool_call", "tool_result", "response"}:
+            self._broadcast_activity(agent_name, event_type_str, data, event_data)
+
+        # 4. Upsert spawn_records on lifecycle events
+        self._upsert_spawn_record(agent_name, event_type_str, data, event_data)
+
+        # 4·R2. Refresh ``last_active_at`` whenever the agent does
+        # something concrete (LLM call or tool round-trip). Lets
+        # ``get_team_status`` distinguish "agent X stuck for 60s" from
+        # "agent X actively working" — the visibility gap that left the orchestrator
+        # in incident b61af7db idling out after seeing identical
+        # ``running`` snapshots.
+        if (
+            run_id
+            and self._registry_db
+            and event_type_str in {"thinking", "response", "tool_call", "tool_result"}
+        ):
+            try:
+                import time as _time
+                self._registry_db.upsert_record(
+                    run_id, {"last_active_at": _time.time()}
+                )
+            except Exception as _exc:
+                logger.debug(
+                    "[REGISTRY] last_active_at update failed for %s: %s",
+                    agent_name, _exc,
+                )
+
+        # 4a+b. Cycle-event dispatch — single entry point that emits
+        # ``team.worker_cycle_closed`` (orchestrator inbox) when workers all stop
+        # running, and ``team.full_cycle_closed`` (user UI) when the
+        # whole team stops running. Idempotent via DB event_id PK.
+        # See _on_member_state_event docstring for the state machine.
+        if run_id and event_type_str in {
+            "started", "result", "idle", "agent_completed",
+            "error", "timeout", "cancelled", "killed",
+        }:
+            self._on_member_state_event(run_id)
+
+        # 4c. Handle removal events — clean DB records
+        if event_type_str == "removed":
+            self._handle_removal(data)
+            return  # Don't push removal events to chat SSE
+
+        # 4d. Handle lifecycle cleanup — broadcast agent_removed for UI sync +
+        # purge the agent's memory (the spawner emits this ONLY for a oneshot that
+        # has been removed from the registry → it's gone for good).
+        if event_type_str == "lifecycle_after_cleanup":
+            self._broadcast_agent_removed(agent_name, data, event_data)
+            self._maybe_purge_oneshot_memory(agent_name, data)
+            return  # Don't push to chat SSE
+
+        # 5. Handle token_usage events — persist + broadcast (monitoring only, not chat SSE)
+        if event_type_str == "token_usage":
+            self._handle_token_usage(agent_name, data, event_data)
+            return
+
+        # 5b. Handle runtime_config — persist agent's resolved config (monitoring only)
+        if event_type_str == "runtime_config":
+            self._handle_runtime_config(agent_name, data, event_data)
+            return
+
+        # 5c. Handle mcp_status — persist MCP health into spawn_registry
+        if event_type_str == "mcp_status":
+            self._handle_mcp_status(agent_name, data, event_data)
+            return
+
+        # 5d. Team lifecycle events — broadcast to activity stream only, not chat SSE
+        if event_type_str.startswith("team_"):
+            self._broadcast_activity(agent_name, event_type_str, data, event_data)
+            return
+
+        # 6. Push to chat SSE queue if there is an active chat request
+        if not self._request_id:
+            return
+
+        # Skip thinking events — they have no reasoning content and clutter the UI
+        if event_type_str == "thinking":
+            return
+
+        # Skip lifecycle events from chat SSE (monitoring only)
+        if event_type_str.startswith("lifecycle_"):
+            return
+
+        sse_event_type, sse_data = self._map_event(agent_name, event_type_str, data)
+        self._pm.push(self._request_id, sse_event_type, sse_data)
+
+    def _map_event(
+        self, agent_name: str, event_type_str: str, data: dict
+    ) -> tuple[str, dict]:
+        """Map a parsed event to an SSE progress event type + data dict."""
+        template = _EVENT_MAP.get(event_type_str)
+        if not template:
+            return "spawn_info", {
+                "agent": agent_name,
+                "agent_display": agent_name,
+                "message": f"ℹ️ {agent_name}: {event_type_str}",
+            }
+
+        event_type, msg_template = template
+
+        # Build message string with safe formatting
+        fmt_vars = {
+            "agent_name": agent_name,
+            "role": agent_name,  # backward compat
+            "tool_name": data.get("tool_name", ""),
+            "server_name": data.get("server_name", ""),
+            "status": "✓" if data.get("status", "ok") == "ok" else "✗",
+            "duration_seconds": data.get("duration_seconds", 0) or 0,
+            "error_msg": str(data.get("message", ""))[:100],
+        }
+        try:
+            message = msg_template.format(**fmt_vars)
+        except (KeyError, ValueError):
+            message = f"{agent_name}: {event_type_str}"
+
+        sse_data: dict[str, Any] = {
+            "agent": agent_name,
+            "agent_display": agent_name,
+            "message": message,
+        }
+
+        # Add tool info for tool_call events
+        if event_type_str == "tool_call":
+            tool_name = data.get("tool_name", "")
+            preview = _sanitize_tool_args_preview(tool_name, data.get("args_preview", ""))
+            sse_data["tools"] = [{
+                "name": tool_name,
+                "args": {"preview": preview} if preview else {},
+            }]
+
+        # Add duration for tool_result events
+        if event_type_str == "tool_result" and data.get("duration_ms"):
+            sse_data["duration_ms"] = int(data["duration_ms"])
+
+        return event_type, sse_data
+
+    # ── DB Persistence ──
+
+    def _persist_activity(self, role: str, event_type_str: str, data: dict, raw: dict) -> None:
+        """Insert event into agent_activities table."""
+        try:
+            from core.database import AgentActivity, get_db_session
+            import time
+
+            db = get_db_session()
+            try:
+                # Build human-readable message
+                _, sse_data = self._map_event(role, event_type_str, data)
+                message = sse_data.get("message", f"{role}: {event_type_str}")
+
+                safe_data = _sanitize_event_data(event_type_str, data)
+                activity = AgentActivity(
+                    agent_name=role,
+                    run_id=raw.get("run_id") or safe_data.get("run_id"),
+                    event_type=event_type_str,
+                    message=message,
+                    data_json=json.dumps(safe_data, ensure_ascii=False, default=str) if safe_data else None,
+                    created_at=raw.get("timestamp") or time.time(),
+                )
+                db.add(activity)
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                logger.warning("Failed to persist activity: %s", e)
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("Could not import DB for activity persistence: %s", e)
+
+    def _forward_message_turn(self, agent_name: str, data: dict, raw: dict) -> None:
+        """Forward a subprocess ``message_turn`` event to the activity stream.
+
+        The subprocess sends the FULL PromptMessageExtended dump; we cache
+        that full payload, then apply truncation before broadcasting so
+        SSE chunks stay reasonable on the wire. The cache lets the
+        ``/messages`` and ``/turns/{idx}/full`` endpoints serve the
+        agent's history after the subprocess exits — same dual-track
+        contract used for in-process clones.
+        """
+        try:
+            import json as _json
+            import time
+            from services.activity_stream import activity_stream_manager
+            from services.agent_message_stream import (
+                trim_message_for_stream,
+                _record_recent_turn,
+            )
+
+            full = data.get("message") or {}
+            turn_idx = data.get("turn_idx")
+            if isinstance(turn_idx, int):
+                _record_recent_turn(agent_name, turn_idx, full)
+
+            try:
+                trimmed = trim_message_for_stream(_json.loads(_json.dumps(full)))
+            except Exception:
+                trimmed = full
+
+            activity_stream_manager.broadcast({
+                "agent_name": agent_name,
+                "event_type": "message_turn",
+                "run_id": raw.get("run_id") or data.get("run_id"),
+                "timestamp": raw.get("timestamp") or time.time(),
+                "data": {
+                    "turn_idx": turn_idx,
+                    "role": data.get("msg_role") or trimmed.get("role"),
+                    "message": trimmed,
+                },
+            })
+        except Exception as e:
+            logger.warning("[message_stream] forward failed for %s: %s", agent_name, e)
+
+    def _broadcast_activity(self, role: str, event_type_str: str, data: dict, raw: dict) -> None:
+        """Broadcast event via ActivityStreamManager for realtime monitoring."""
+        try:
+            from services.activity_stream import activity_stream_manager
+            import time
+
+            safe_data = _sanitize_event_data(event_type_str, data)
+            _, sse_data = self._map_event(role, event_type_str, safe_data)
+            activity_stream_manager.broadcast({
+                "agent_name": role,
+                "event_type": event_type_str,
+                "message": sse_data.get("message", ""),
+                "data": safe_data,
+                "run_id": raw.get("run_id") or safe_data.get("run_id"),
+                "timestamp": raw.get("timestamp") or time.time(),
+            })
+        except Exception as e:
+            logger.warning("Failed to broadcast activity: %s", e)
+
+    def _broadcast_agent_removed(self, agent_name: str, data: dict, raw: dict) -> None:
+        """Broadcast agent_removed event via ActivityStreamManager.
+
+        This is the critical handler for oneshot agent cleanup:
+        when a spawned agent completes and is cleaned up, this broadcasts
+        an 'agent_removed' event so the dashboard can update its UI
+        (e.g., remove the agent card or show 'completed & removed' status).
+        """
+        try:
+            from services.activity_stream import activity_stream_manager
+            import time
+
+            run_id = raw.get("run_id") or data.get("run_id", "")
+            lifecycle = data.get("lifecycle", "oneshot")
+            reason = data.get("reason", "cleanup")
+
+            activity_stream_manager.broadcast({
+                "agent_name": agent_name,
+                "event_type": "agent_removed",
+                "message": f"🗑️ {agent_name} removed ({reason})",
+                "data": {
+                    "run_id": run_id,
+                    "lifecycle": lifecycle,
+                    "reason": reason,
+                    "agent_name": data.get("agent_name", agent_name),
+                    "team_name": data.get("team_name", ""),
+                },
+                "run_id": run_id,
+                "timestamp": raw.get("timestamp") or time.time(),
+            })
+
+            logger.info(
+                "[LIFECYCLE] Agent removed: %s (run_id=%s, lifecycle=%s, reason=%s)",
+                agent_name, run_id, lifecycle, reason,
+            )
+
+            # Drop the per-agent turn cache for this name. Without this
+            # the global ``_recent_turns`` keyset grows unbounded across
+            # team spawns (each new team adds N agent names; old names
+            # never get evicted). Per-agent bucket is already capped at
+            # 200 turns, but keyset growth across weeks of spawns adds
+            # up. Clearing on lifecycle removal is the natural pairing.
+            try:
+                from services.agent_message_stream import reset_recent_turns
+                reset_recent_turns(agent_name)
+            except Exception as _evict_exc:
+                logger.warning(
+                    "Failed to evict _recent_turns for %s: %s",
+                    agent_name, _evict_exc,
+                )
+        except Exception as e:
+            logger.warning("Failed to broadcast agent_removed: %s", e)
+
+    def _handle_removal(self, data: dict) -> None:
+        """Delete spawn_registry and agent_activities for removed agents."""
+        agent_names = data.get("agent_names", [])
+        run_ids = data.get("run_ids", [])
+
+        if not agent_names and not run_ids:
+            return
+
+        try:
+            import sqlite3 as _sqlite3
+
+            # 1. Delete from spawn_registry table (raw sqlite3)
+            deleted_records = 0
+            if run_ids:
+                try:
+                    db_path = os.environ.get("SPAWN_REGISTRY_DB", "data/jarvis.db")
+                    with _sqlite3.connect(db_path, timeout=10) as conn:
+                        placeholders = ",".join("?" * len(run_ids))
+                        cursor = conn.execute(
+                            f"DELETE FROM spawn_registry WHERE run_id IN ({placeholders})",
+                            run_ids,
+                        )
+                        deleted_records = cursor.rowcount
+                except Exception as e:
+                    logger.warning("Failed to delete spawn_registry records: %s", e)
+
+            # 2. Delete from agent_activities (SQLAlchemy)
+            deleted_activities = 0
+            try:
+                from core.database import AgentActivity, get_db_session
+
+                db = get_db_session()
+                try:
+                    if agent_names:
+                        deleted_activities += db.query(AgentActivity).filter(
+                            AgentActivity.agent_name.in_(agent_names)
+                        ).delete(synchronize_session=False)
+                    elif run_ids:
+                        deleted_activities += db.query(AgentActivity).filter(
+                            AgentActivity.run_id.in_(run_ids)
+                        ).delete(synchronize_session=False)
+                    db.commit()
+                except Exception as e:
+                    db.rollback()
+                    logger.warning("Failed to clean agent_activities on removal: %s", e)
+                finally:
+                    db.close()
+            except Exception as e:
+                logger.warning("Could not import DB for activity cleanup: %s", e)
+
+            # 3. Delete context window snapshots
+            deleted_snapshots = 0
+            try:
+                from services.context_persistence import delete_agent_snapshots
+
+                for name in agent_names:
+                    if name:
+                        deleted_snapshots += delete_agent_snapshots(name)
+            except Exception as e:
+                logger.warning("Failed to clean context snapshots on removal: %s", e)
+
+            logger.info(
+                "[REMOVAL] Cleaned DB: %d spawn_registry, %d activities, %d snapshots for %s",
+                deleted_records,
+                deleted_activities,
+                deleted_snapshots,
+                agent_names or run_ids,
+            )
+        except Exception as e:
+            logger.warning("Failed to handle removal: %s", e)
+
+    def _maybe_purge_oneshot_memory(self, agent_name: str, data: dict) -> None:
+        """Purge a cleaned-up ONESHOT agent's memory silo (it's gone for good — its
+        unique name will never run again). Driven by ``lifecycle_after_cleanup``,
+        which the spawner (agent_spawner_server on_after_cleanup) emits ONLY for a
+        oneshot, after registry removal. Reuses ``purge_agent_memory`` (the same
+        cleanup the DELETE endpoint runs). Best-effort: never block event flow.
+        """
+        if data.get("lifecycle") != "oneshot":        # defensive: oneshot-only
+            return
+        if not agent_name or agent_name == "agent":   # defensive: no real identity
+            return
+        # Fail-safe for an IRREVERSIBLE delete: never wipe a PERSISTENT agent's silo.
+        # Spawn-time uniqueness (fast-agent ensure_unique_agent_name) should stop a
+        # oneshot from ever sharing a persistent name, but a destructive op must not
+        # trust an invariant enforced in another module — probe the authoritative
+        # sources here. If a future creation path bypasses the uniqueness gate, or we
+        # simply can't verify, we skip rather than risk deleting Jarvis's memory.
+        try:
+            import services.shared_state as _state
+            from services.agent_definitions import get_definition
+            live = getattr(_state.agent_app, "_agents", None) or {}
+            is_persistent = agent_name in live or get_definition(agent_name) is not None
+        except Exception:
+            is_persistent = True   # cannot verify → fail SAFE (do not delete)
+        if is_persistent:
+            logger.warning("[SPAWN] skipping oneshot memory purge for %r — it matches a "
+                           "persistent agent (static/dynamic), not a throwaway oneshot", agent_name)
+            return
+        try:
+            from core.database import get_db_session
+            from services.memory.memory_service import purge_agent_memory
+            db = get_db_session()
+            try:
+                counts = purge_agent_memory(db, agent_name)
+                if any(counts.values()):
+                    logger.info("[SPAWN] purged completed oneshot %s memory: %s",
+                                agent_name, counts)
+            finally:
+                db.close()
+        except Exception as exc:  # noqa: BLE001 — cleanup must not break the bridge
+            logger.warning("[SPAWN] oneshot memory purge failed for %s: %s", agent_name, exc)
+
+    def _upsert_spawn_record(self, role: str, event_type_str: str, data: dict, raw: dict) -> None:
+        """Upsert spawn_records on lifecycle events (started, result, error)."""
+        if not self._registry_db:
+            return
+        if event_type_str not in (
+            "started",
+            "result",
+            "error",
+            "lifecycle_spawn_registered",
+            "idle",
+            "resumed",
+            "agent_paused",
+            "agent_resumed",
+        ):
+            return
+
+        try:
+            import time
+            run_id = raw.get("run_id") or data.get("run_id")
+            if not run_id:
+                return
+
+            # Read existing DB record for enrichment
+            db_rec: dict = {}
+            try:
+                db_rec = self._registry_db.get_record(run_id) or {}
+            except Exception:
+                pass
+
+            # Primary source: event data carries lifecycle/team_name
+            # (emitted by isolated_runner.py in the 'started' event)
+            evt_lifecycle = data.get("lifecycle", "")
+            evt_team_name = data.get("team_name", "")
+
+            # Fallback: cross-read from spawn_registry table
+            if (not evt_lifecycle and not db_rec.get("lifecycle")) or \
+               (not evt_team_name and not db_rec.get("team_name")):
+                try:
+                    import sqlite3 as _sqlite3
+                    import json as _json
+                    db_path = os.environ.get("SPAWN_REGISTRY_DB")
+                    if db_path:
+                        _conn = _sqlite3.connect(db_path, timeout=5)
+                        _row = _conn.execute(
+                            "SELECT data_json FROM spawn_registry WHERE run_id = ?",
+                            (run_id,),
+                        ).fetchone()
+                        _conn.close()
+                        if _row:
+                            sr_rec = _json.loads(_row[0])
+                            for key in ("lifecycle", "team_name", "role", "task",
+                                        "session_id", "pid", "original_config", "servers"):
+                                if sr_rec.get(key) and not db_rec.get(key):
+                                    db_rec[key] = sr_rec[key]
+                except Exception:
+                    pass
+
+            # Resolve lifecycle: event > db_rec
+            lifecycle = evt_lifecycle or db_rec.get("lifecycle", "")
+            team_name = evt_team_name or db_rec.get("team_name", "")
+
+            # Determine status based on lifecycle
+            if event_type_str in ("started", "lifecycle_pre_spawn"):
+                status = "running"
+            elif event_type_str == "lifecycle_registered":
+                status = "starting"
+            elif event_type_str == "idle":
+                status = "idle"
+            elif event_type_str == "resumed":
+                status = "running"
+            elif event_type_str == "agent_paused":
+                status = "paused"
+            elif event_type_str == "agent_resumed":
+                status = "running"
+            elif event_type_str == "result":
+                status = "idle" if lifecycle == "resumable" else "completed"
+            elif event_type_str == "lifecycle_spawn_registered":
+                status = data.get("status") or db_rec.get("status") or "starting"
+            else:
+                status = "error"
+
+            record_data = {
+                "agent_name": role,
+                "name": role,
+                "status": status,
+            }
+            # Only set started_at on the spawn events — later events (idle,
+            # resumed, paused) would otherwise overwrite the original spawn
+            # time and corrupt ordering/orchestrator-detection logic that
+            # sorts by started_at.
+            if event_type_str in ("started", "lifecycle_spawn_registered"):
+                record_data["started_at"] = raw.get("timestamp") or time.time()
+
+            # Set lifecycle and team_name (resolved above)
+            if lifecycle:
+                record_data["lifecycle"] = lifecycle
+            if team_name:
+                record_data["team_name"] = team_name
+
+            # Enrich from existing DB record
+            if db_rec.get("role"):
+                record_data["role"] = db_rec["role"]
+            if db_rec.get("pid"):
+                record_data["pid"] = db_rec["pid"]
+            if db_rec.get("task"):
+                record_data["task"] = str(db_rec["task"])[:500]
+            if db_rec.get("session_id"):
+                record_data["session_id"] = db_rec["session_id"]
+            if db_rec.get("original_config"):
+                record_data["original_config"] = db_rec["original_config"]
+
+            if event_type_str == "result":
+                record_data["completed_at"] = raw.get("timestamp") or time.time()
+                record_data["result"] = str(data.get("message", ""))[:500]
+            elif event_type_str == "error":
+                record_data["completed_at"] = raw.get("timestamp") or time.time()
+                record_data["error"] = str(data.get("message", ""))[:500]
+
+            self._registry_db.upsert_record(run_id, record_data)
+
+            # Late-joiner hook: if this is a spawn-registration event AND
+            # the team is currently paused, pause the new member before
+            # it has a chance to run. Closes the window between
+            # spawn-record insert and first ``before_llm_call`` checkpoint
+            # — without this, an agent joining a paused team would happily
+            # run a free turn before any checkpoint blocked it.
+            if event_type_str in ("started", "lifecycle_spawn_registered") and team_name:
+                try:
+                    from services.pause_controller import pause_controller
+                    if pause_controller.is_team_paused(team_name) and \
+                       not pause_controller.is_paused(role):
+                        pause_controller.pause(role)
+                        logger.info(
+                            "[PAUSE] Auto-paused late joiner %s into paused team %s",
+                            role, team_name,
+                        )
+                except Exception as pe:
+                    # Pause hook is best-effort — never break spawn registration.
+                    logger.warning("[PAUSE] late-joiner check failed: %s", pe)
+        except Exception as e:
+            logger.warning("Failed to upsert spawn record: %s", e)
+
+    def _handle_token_usage(self, agent_name: str, data: dict, raw: dict) -> None:
+        """Persist and broadcast DELTA token usage from spawned child processes.
+
+        The subprocess reports cumulative totals that grow with each LLM call.
+        We track the last-seen cumulative values per (agent_name, run_id) and
+        only forward the DELTA to avoid double-counting on the dashboard.
+        """
+        try:
+            from services.sse_progress import _persist_and_broadcast_token_usage
+
+            run_id = raw.get("run_id") or data.get("run_id") or ""
+            key = f"{agent_name}:{run_id}"
+
+            # Current cumulative from subprocess
+            cum_input = data.get("input_tokens", 0)
+            cum_output = data.get("output_tokens", 0)
+            cum_cache_hit = data.get("cache_hit_tokens", 0)
+            cum_cache_read = data.get("cache_read_tokens", 0)
+            cum_cache_write = data.get("cache_write_tokens", 0)
+            cum_reasoning = data.get("reasoning_tokens", 0)
+
+            # Get previous cumulative values
+            prev = self._token_accumulators.get(key, {})
+            prev_input = prev.get("input", 0)
+            prev_output = prev.get("output", 0)
+            prev_cache_hit = prev.get("cache_hit", 0)
+            prev_cache_read = prev.get("cache_read", 0)
+            prev_cache_write = prev.get("cache_write", 0)
+            prev_reasoning = prev.get("reasoning", 0)
+
+            # Calculate deltas (clamp to 0 in case of reset)
+            delta_input = max(0, cum_input - prev_input)
+            delta_output = max(0, cum_output - prev_output)
+            delta_cache_hit = max(0, cum_cache_hit - prev_cache_hit)
+            delta_cache_read = max(0, cum_cache_read - prev_cache_read)
+            delta_cache_write = max(0, cum_cache_write - prev_cache_write)
+            delta_reasoning = max(0, cum_reasoning - prev_reasoning)
+
+            # Update accumulator with current cumulative values
+            self._token_accumulators[key] = {
+                "input": cum_input,
+                "output": cum_output,
+                "cache_hit": cum_cache_hit,
+                "cache_read": cum_cache_read,
+                "cache_write": cum_cache_write,
+                "reasoning": cum_reasoning,
+            }
+
+            # Skip if no delta (duplicate event)
+            if delta_input == 0 and delta_output == 0:
+                return
+
+            tokens = {
+                "input": delta_input,
+                "output": delta_output,
+                "total": delta_input + delta_output,
+                "model": data.get("model", "unknown"),
+                "cache_hit": delta_cache_hit,
+                "cache_read": delta_cache_read,
+                "cache_write": delta_cache_write,
+                "reasoning": delta_reasoning,
+            }
+            _persist_and_broadcast_token_usage(agent_name, run_id, tokens)
+            logger.info(
+                "[TOKEN] Spawned agent %s: model=%s Δin=%d Δout=%d Δcache=%d (cum: in=%d out=%d)",
+                agent_name,
+                tokens["model"],
+                delta_input,
+                delta_output,
+                delta_cache_hit + delta_cache_read,
+                cum_input,
+                cum_output,
+            )
+        except Exception as e:
+            logger.warning("Failed to handle spawned token_usage: %s", e)
+
+    def _handle_runtime_config(self, agent_name: str, data: dict, raw: dict) -> None:
+        """Persist runtime-resolved config from a spawned agent.
+
+        The isolated_runner emits this event after the agent is fully initialized,
+        containing the resolved instruction (with skills injected), loaded skill
+        manifests, and per-server tool lists — all read from the live agent instance.
+        """
+        run_id = raw.get("run_id") or data.get("run_id")
+        if not run_id:
+            return
+
+        runtime_config = {
+            "resolved_instruction": data.get("resolved_instruction", ""),
+            "skills": data.get("skills", []),
+            "tools": data.get("tools", {}),
+        }
+
+        # 1. Update SQLite spawn record
+        if self._registry_db:
+            try:
+                self._registry_db.upsert_record(run_id, {
+                    "agent_name": agent_name,
+                    "runtime_config": runtime_config,
+                })
+            except Exception as e:
+                logger.debug("Failed to update SQLite with runtime_config: %s", e)
+
+        # 3. Upsert per-server tool lists into mcp_server_tools table
+        tools_data = runtime_config.get("tools", {})
+        if tools_data and self._registry_db:
+            try:
+                updated = self._registry_db.bulk_upsert_server_tools(tools_data)
+                if updated:
+                    logger.debug("[RUNTIME_CONFIG] Cached tools for %d servers", updated)
+            except Exception as e:
+                logger.debug("Failed to cache server tools: %s", e)
+
+        logger.info(
+            "[RUNTIME_CONFIG] %s: skills=%d servers=%d",
+            agent_name,
+            len(runtime_config["skills"]),
+            len(runtime_config["tools"]),
+        )
+
+        # Push: tell dashboard the runtime introspection is ready so AgentDetail can refetch.
+        self._broadcast_runtime_ready(agent_name, run_id, raw)
+
+    def _handle_mcp_status(self, agent_name: str, data: dict, raw: dict) -> None:
+        """Persist MCP health status from spawned agent.
+
+        Reports which configured MCP servers connected vs failed,
+        enabling dashboard monitoring and debugging of silent failures.
+        """
+        run_id = raw.get("run_id") or data.get("run_id")
+        total_configured = data.get("total_configured", 0)
+        total_connected = data.get("total_connected", 0)
+        total_failed = data.get("total_failed", 0)
+        servers = data.get("servers", {})
+
+        # Persist to spawn_registry
+        if run_id and self._registry_db:
+            try:
+                self._registry_db.upsert_record(run_id, {
+                    "agent_name": agent_name,
+                    "mcp_status": {
+                        "total_configured": total_configured,
+                        "total_connected": total_connected,
+                        "total_failed": total_failed,
+                        "servers": servers,
+                    },
+                })
+            except Exception as e:
+                logger.debug("Failed to update SQLite with mcp_status: %s", e)
+
+        # Log summary with pass/fail
+        if total_failed > 0:
+            failed_names = [s for s, v in servers.items() if v.get("status") == "failed"]
+            logger.warning(
+                "[MCP_STATUS] ❌ %s: %d/%d connected, FAILED: %s",
+                agent_name, total_connected, total_configured, failed_names,
+            )
+        else:
+            logger.info(
+                "[MCP_STATUS] ✅ %s: %d/%d all connected",
+                agent_name, total_connected, total_configured,
+            )
+
+        # Push: tell dashboard MCP status changed so AgentDetail can refetch.
+        if run_id:
+            self._broadcast_runtime_ready(agent_name, run_id, raw)
+
+    def _broadcast_runtime_ready(self, agent_name: str, run_id: str, raw: dict) -> None:
+        """Notify dashboard subscribers that the agent's runtime introspection
+        (resolved skills / MCP attach status) has been updated, so AgentDetail
+        can refetch without polling."""
+        try:
+            from services.activity_stream import activity_stream_manager
+            import time
+
+            activity_stream_manager.broadcast({
+                "agent_name": agent_name,
+                "event_type": "runtime_config_ready",
+                "message": "",
+                "data": {"agent_name": agent_name, "run_id": run_id},
+                "run_id": run_id,
+                "timestamp": raw.get("timestamp") or time.time(),
+            })
+        except Exception as e:
+            logger.warning("Failed to broadcast runtime_config_ready: %s", e)
+
+    # ── Active-meeting awareness for completion notifications ──
+
+    @staticmethod
+    def _active_meetings_with_members(member_names: set[str]) -> list[dict]:
+        """Return active meetings (``ended=0``) whose participants overlap
+        with ``member_names``.
+
+        Used by both completion-notification paths to suppress the misleading
+        "team finished" message when the team is actually idled mid-meeting
+        (incident b61af7db: the orchestrator saw "All members finished | No output" while
+        meeting was hanging on a stuck speaker).
+
+        Returns a list of dicts with the fields needed for messaging:
+        ``meeting_id``, ``agenda``, ``current_speaker``, ``current_round``,
+        ``max_rounds``, ``last_action_at``, ``last_action_ago``,
+        ``last_3_turns``. Empty list if no overlap or DB unavailable.
+        """
+        import sqlite3 as _sqlite3
+        import time as _time
+
+        if not member_names:
+            return []
+
+        db_path = os.environ.get("SPAWN_REGISTRY_DB", "data/jarvis.db")
+        results: list[dict] = []
+
+        try:
+            with _sqlite3.connect(db_path, timeout=5) as conn:
+                conn.row_factory = _sqlite3.Row
+                rows = conn.execute(
+                    "SELECT meeting_id, config_json, state_json "
+                    "FROM meetings "
+                    "WHERE json_extract(state_json, '$.ended') = 0"
+                ).fetchall()
+
+                for r in rows:
+                    try:
+                        config = json.loads(r["config_json"]) if r["config_json"] else {}
+                        state = json.loads(r["state_json"]) if r["state_json"] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+
+                    parts = state.get("participants") or []
+                    if not (set(parts) & member_names):
+                        continue
+
+                    current_turn = state.get("current_turn", 0)
+                    speaker = parts[current_turn] if current_turn < len(parts) else "(unknown)"
+
+                    last_at = state.get("turn_started_at") or 0.0
+                    ago_sec = max(0, int(_time.time() - last_at)) if last_at else None
+
+                    # Pull last 3 turns for context preview
+                    turn_rows = conn.execute(
+                        "SELECT agent, message, round FROM meeting_transcripts "
+                        "WHERE meeting_id = ? ORDER BY id DESC LIMIT 3",
+                        (r["meeting_id"],),
+                    ).fetchall()
+                    last_3 = [
+                        {
+                            "agent": tr["agent"],
+                            "round": tr["round"],
+                            "message_preview": (tr["message"] or "")[:160].replace("\n", " "),
+                        }
+                        for tr in reversed(turn_rows)
+                    ]
+
+                    results.append({
+                        "meeting_id": r["meeting_id"],
+                        "agenda": config.get("agenda", ""),
+                        "current_speaker": speaker,
+                        "current_round": state.get("current_round", 1),
+                        "max_rounds": state.get("max_rounds", 0),
+                        "last_action_at": last_at,
+                        "last_action_ago_sec": ago_sec,
+                        "last_3_turns": last_3,
+                    })
+        except Exception as exc:
+            logger.debug("[ACTIVE_MEETING] Lookup failed: %s", exc)
+            return []
+
+        return results
+
+    @staticmethod
+    def _format_active_meetings_warning(active: list[dict]) -> str:
+        """Render the meeting-stalled warning block (markdown).
+
+        Caller embeds this into the team-completion message so the
+        orchestrator sees actionable state — bottleneck speaker,
+        time since last turn, last 3 turns — instead of "No output".
+        """
+        if not active:
+            return ""
+
+        lines = ["", "⚠️ **Active meetings detected — team is NOT done:**", ""]
+        for m in active:
+            ago_sec = m.get("last_action_ago_sec")
+            ago_str = f"{ago_sec}s ago" if ago_sec is not None else "(unknown)"
+            lines.append(
+                f"- Meeting `{m['meeting_id']}` — round {m['current_round']}/{m['max_rounds']}, "
+                f"waiting on **{m['current_speaker']}** (last action: {ago_str})"
+            )
+            agenda = (m.get("agenda") or "").strip()
+            if agenda:
+                lines.append(f"  - Agenda: {agenda[:120]}")
+            for t in m.get("last_3_turns", []):
+                lines.append(
+                    f"  - [{t['agent']} R{t['round']}] {t['message_preview']}"
+                )
+        lines.append("")
+        lines.append(
+            "Action: review transcript and either resume the bottleneck "
+            "speaker, end the meeting via verdict, or use ``leave_meeting`` "
+            "to release stuck participants."
+        )
+        return "\n".join(lines)
+
+    def _find_orchestrator(
+        self, members: list[dict], session_id: str = "",
+    ) -> dict | None:
+        """Find the orchestrator agent from team members.
+
+        The orchestrator is whichever role the team's *template* declares
+        as the orchestrator — read from
+        ``team_sessions.template.orchestrator`` (the single source of
+        truth). The earlier implementation matched substring "pm" /
+        "orchestrator" in the role string; that broke any template whose
+        orchestrator role wasn't literally named "pm" (a hard-coded
+        assumption the rest of the architecture has long since outgrown).
+
+        Args:
+            members: registry rows for this team
+            session_id: team session id — used to look up the template's
+                ``orchestrator`` field. When empty (legacy callers), we
+                fall through to the spawn-order fallback below.
+
+        Returns:
+            The member dict whose ``role`` equals
+            ``template.orchestrator`` (case-insensitive), or — only if
+            that lookup fails or no member matches — the first member by
+            ``started_at`` (because the orchestrator spawns first).
+        """
+        orch_role = self._lookup_orchestrator_role(session_id) if session_id else ""
+        if orch_role:
+            target = orch_role.lower()
+            for m in members:
+                if (m.get("role") or "").lower() == target:
+                    return m
+            # Template named an orchestrator role but no member has it —
+            # likely a transient state during respawn. Log so the gap is
+            # visible, then fall through to spawn-order fallback.
+            logger.warning(
+                "[CYCLE] session=%s: template.orchestrator=%r but no "
+                "member has that role; falling back to first-spawned.",
+                session_id, orch_role,
+            )
+        # Fallback: first agent by started_at (orchestrator spawns first).
+        # Kept for: (a) ad-hoc spawns with no session_id, (b) the rare
+        # window between template edit and registry resync, (c) defensive
+        # protection so the bridge never returns None for a non-empty team.
+        members_sorted = sorted(members, key=lambda m: m.get("started_at", 0))
+        return members_sorted[0] if members_sorted else None
+
+    def _lookup_orchestrator_role(self, session_id: str) -> str:
+        """Return ``template.orchestrator`` (role key) for the session.
+
+        Reads through ``get_team_session`` which is the canonical accessor
+        for the team_sessions row. Returns ``""`` if the session does not
+        exist, the template is missing, or the lookup raises — callers
+        treat empty string as "fall back to heuristic".
+        """
+        try:
+            from fast_agent.spawn.team_spawner import get_team_session
+
+            session = get_team_session(session_id)
+            if session is None:
+                return ""
+            template = getattr(session, "template", None) or {}
+            return str(template.get("orchestrator", "") or "")
+        except Exception as exc:
+            logger.debug(
+                "[CYCLE] _lookup_orchestrator_role(%s) failed: %s",
+                session_id, exc,
+            )
+            return ""
+
+    def _compose_team_result_body(
+        self, *, team_name: str, agent_name: str, result: str
+    ) -> tuple[str, str]:
+        """Render notification (preview, content) from the orchestrator's
+        ``spawn_registry.result``.
+
+        Fails loud when the field is empty: emits an ERROR log so the
+        gap is visible in ops, and renders a notification body that
+        explicitly states which agent and run is missing data. We do
+        NOT substitute a generic "Team done" placeholder — that hides
+        the bug from the user. The proper data source is the per-turn
+        write hook in ``services.context_persistence.save_agent_context``;
+        if you see this body, that hook did not fire for this run.
+        """
+        if result and result.strip():
+            preview = result[:200].replace("\n", " ").strip()
+            return preview, result
+
+        logger.error(
+            "[TEAM_NOTIFY] Orchestrator result MISSING for team=%s agent=%s — "
+            "spawn_registry.result was empty at team_completion. Expected the "
+            "context_persistence write hook to have mirrored the last assistant "
+            "text on the agent's final turn. Check that save_agent_context ran "
+            "for this run and that the agent produced text content (not only "
+            "tool_calls) on its last turn.",
+            team_name, agent_name,
+        )
+        preview = (
+            f"⚠️ BUG: orchestrator result missing for {agent_name} "
+            f"(team {team_name}) — see logs"
+        )
+        content = (
+            f"## ⚠️ Orchestrator result missing\n\n"
+            f"- **Team:** `{team_name}`\n"
+            f"- **Orchestrator:** `{agent_name}`\n\n"
+            f"`spawn_registry.result` was empty when the team-completion "
+            f"notification fired. The notification creator does not fall "
+            f"back to other sources (per project policy: fail loud, no "
+            f"silent fallbacks).\n\n"
+            f"### Likely causes\n"
+            f"- The agent's last turn was a tool_call without any "
+            f"assistant text content.\n"
+            f"- `services.context_persistence.save_agent_context` did not "
+            f"run for this run (snapshot trigger missed).\n"
+            f"- `spawn_registry` row for this run was missing when the "
+            f"snapshot hook tried to mirror the result.\n\n"
+            f"Open the agent's latest snapshot in `agent_context_snapshots` "
+            f"to recover the response manually."
+        )
+        return preview, content
+
+    def _create_team_notification(
+        self, team_name: str, agent_name: str, result: str, members: list[dict],
+        *, session_id: str = "",
+    ) -> None:
+        """Create notification + broadcast SSE for team completion.
+
+        If any team member is still a participant in an active meeting,
+        the notification is reframed from "Team finished" to "Team idled
+        with active meeting" — this surfaces meeting state (bottleneck
+        speaker, last action time, recent turns) so the user can
+        intervene instead of believing the team is done.
+        """
+        try:
+            import time
+            from core.database import NotificationModel, get_db_session
+            from services.cron_scheduler import scheduler_stream_manager
+
+            total = len(members)
+            errors = sum(1 for m in members if m.get("status") == "error")
+
+            # Detect "idled mid-meeting" — flips the framing of this notification.
+            member_names = {
+                m.get("agent_name", "") for m in members if m.get("agent_name")
+            }
+            active_meetings = self._active_meetings_with_members(member_names)
+
+            if active_meetings:
+                meeting_count = len(active_meetings)
+                title = (
+                    f"⏳ Team {team_name} idled with {meeting_count} active "
+                    f"meeting{'s' if meeting_count > 1 else ''} — needs intervention"
+                )
+                preview = (
+                    f"{meeting_count} meeting(s) still open — "
+                    f"last waiting on {active_meetings[0]['current_speaker']}"
+                )
+                content = (
+                    (result or "(no orchestrator result)")
+                    + self._format_active_meetings_warning(active_meetings)
+                )
+            elif errors:
+                title = f"⚠️ Team {team_name} completed ({errors}/{total} errors)"
+                preview, content = self._compose_team_result_body(
+                    team_name=team_name, agent_name=agent_name, result=result,
+                )
+            else:
+                title = f"✅ Team {team_name} completed ({total} agents)"
+                preview, content = self._compose_team_result_body(
+                    team_name=team_name, agent_name=agent_name, result=result,
+                )
+
+            db = get_db_session()
+            try:
+                notif = NotificationModel(
+                    type="agent_result",
+                    title=title,
+                    preview=preview,
+                    content=content,
+                    content_type="markdown",
+                    is_read=0,
+                    created_at=time.time(),
+                    # ⚠️ JSON SPACING IS LOAD-BEARING — do NOT change separators.
+                    #
+                    # ``json.dumps()`` default is ``separators=(', ', ': ')``.
+                    # ``routes/agents.delete_team`` and
+                    # ``_has_team_notification`` both query this column with
+                    # ``metadata_json.contains('"team_name": "X"')`` (note the
+                    # space after the colon). If you switch to
+                    # ``separators=(',', ':')`` here, BOTH queries silently
+                    # match nothing → dedupe breaks (duplicate notifs) AND
+                    # delete_team cleanup breaks (orphan notifs blocking
+                    # re-spawn of same team_name).
+                    #
+                    # Future migration: switch both sides to a real JSON1
+                    # query (``json_extract(metadata_json, '$.team_name')``)
+                    # so spacing becomes irrelevant.
+                    metadata_json=json.dumps({
+                        "agent": agent_name,
+                        "team_name": team_name,
+                        "session_id": session_id,
+                        "total_agents": total,
+                        "errors": errors,
+                        "source": "team_completion",
+                    }),
+                )
+                db.add(notif)
+                db.commit()
+                db.refresh(notif)
+
+                # Broadcast via scheduler SSE (dashboard already handles new_notification)
+                scheduler_stream_manager.broadcast({
+                    "type": "new_notification",
+                    "id": notif.id,
+                    "notif_type": "agent_result",
+                    "title": title,
+                    "preview": preview,
+                    "created_at": notif.created_at,
+                })
+
+                logger.info(
+                    "[TEAM_NOTIFY] Created notification for team '%s': %d agents, %d errors",
+                    team_name, total, errors,
+                )
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("Failed to create team notification: %s", e, exc_info=True)
+
+    def _resolve_messages_dir(self, members: list[dict]) -> str:
+        """Resolve TEAM_MESSAGES_DIR from any team member's original_config."""
+        from pathlib import Path
+
+        for m in members:
+            env_vars = m.get("original_config", {}).get("env_vars", {})
+            messages_dir = env_vars.get("TEAM_MESSAGES_DIR", "")
+            if messages_dir and Path(messages_dir).exists():
+                return messages_dir
+        return ""
+
+    async def _trigger_orchestrator_resume(
+        self, orch_record: dict, team_name: str,
+    ) -> None:
+        """Resume idle orchestrator to process team status notification.
+
+        Uses the same inject_resume pattern as prompt injection — loads
+        context from DB, spawns new subprocess with full conversation history.
+        The team status report is already in MessageBus inbox, so
+        _check_and_resume_on_inbox will pick it up during spawn.
+        """
+        orch_name = orch_record.get("agent_name", "")
+        try:
+            from services.inject_resume import resume_with_inject
+
+            result = await resume_with_inject(
+                agent_name=orch_name,
+                inject_message=(
+                    "Check your inbox for team status updates. "
+                    "Review member results and decide next actions."
+                ),
+                spawn_record=orch_record,
+                bridge=self,
+            )
+            logger.info(
+                "[TEAM_NOTIFY] Resumed orchestrator %s → run_id=%s (team=%s)",
+                orch_name, result.get("run_id"), team_name,
+            )
+        except Exception as e:
+            logger.warning(
+                "[TEAM_NOTIFY] Failed to resume orchestrator %s: %s",
+                orch_name, e, exc_info=True,
+            )
+
+    # ── Event-stream cycle handler ────────────────────────────────────
+    #
+    # Replaces the previous dedup-based notification pair
+    # (``_check_team_completion`` + ``_notify_orchestrator_on_members_idle``)
+    # with a transition-based event stream. The previous design tried to
+    # silence duplicate notifications via in-memory hash or DB content
+    # filter, but the dedup keys were too coarse — once a session had
+    # ever notified, every subsequent "all idle" cycle was silently
+    # dropped (production 2026-05-16: session ``be885ae8`` only ever got
+    # 1 user notification despite N work cycles).
+    #
+    # New model:
+    #
+    #   * Two named cycles per session: ``worker_cycle`` (orchestrator-facing) and
+    #     ``team_cycle`` (user-facing). Open when at least one relevant
+    #     agent is ``running``; close when all are non-running.
+    #   * On every member state-change event, recompute both cycles
+    #     from the registry (single source of truth) and compare to the
+    #     last persisted state. Emit close events on the open→closed
+    #     transition only.
+    #   * Idempotency lives at the DB layer via ``team_events.event_id``
+    #     PRIMARY KEY + ``INSERT ... ON CONFLICT DO NOTHING``. No
+    #     application-level dedup; no in-memory hash.
+    #   * Cycle state persists in ``team_cycle_state`` so backend
+    #     restarts resume the correct transition view (no false fire,
+    #     no missed close).
+
+    def _ensure_event_tables(self) -> None:
+        """Create event-stream tables on first use. Mirrors the lazy
+        ``CREATE TABLE IF NOT EXISTS`` pattern from
+        ``core.agent_registry_db._ensure_team_sessions_table``.
+        """
+        try:
+            from core.agent_registry_db import _connect
+
+            with _connect() as conn:
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS team_events (
+                        event_id    TEXT PRIMARY KEY,
+                        event_type  TEXT NOT NULL,
+                        session_id  TEXT NOT NULL,
+                        team_name   TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        created_at  REAL NOT NULL
+                    )"""
+                )
+                conn.execute(
+                    """CREATE INDEX IF NOT EXISTS ix_team_events_session
+                       ON team_events(session_id, created_at)"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS team_cycle_state (
+                        session_id    TEXT PRIMARY KEY,
+                        worker_open   INTEGER NOT NULL DEFAULT 0,
+                        team_open     INTEGER NOT NULL DEFAULT 0,
+                        updated_at    REAL NOT NULL
+                    )"""
+                )
+                # 2026-05-19 migration — see _on_member_state_event docstring.
+                # Adds:
+                #   * orch_running       — tracks whether the team's
+                #     orchestrator (per template.orchestrator — the
+                #     system makes no role-name assumption; every
+                #     template names its own orchestrator role) is
+                #     currently ``running``. With the
+                #     old gating ``team_open = any(spawned running)``,
+                #     full_cycle_closed fired the moment workers stopped
+                #     even though the orchestrator had not yet had a
+                #     chance to process the worker reports pushed via
+                #     _trigger_orchestrator_resume — producing a bogus
+                #     "team done" notify (incident 2026-05-19 notify
+                #     #39) which the real "orchestrator idled after
+                #     work" notify (#40) then duplicated.
+                #   * team_close_seq / worker_close_seq — replace the
+                #     uuid-in-event_id dedupe key that was silently
+                #     defeating ``team_events`` PK conflict detection.
+                #     Counters increment atomically inside a guarded
+                #     UPDATE so the cycle's canonical close handler is
+                #     race-free.
+                # ``ALTER TABLE ADD COLUMN`` is idempotent across SQLite
+                # restarts because we swallow ``duplicate column name``
+                # OperationalError. NOT NULL DEFAULT 0 backfills existing
+                # rows so old sessions resume cleanly without crash.
+                for ddl in (
+                    "ALTER TABLE team_cycle_state ADD COLUMN orch_running INTEGER NOT NULL DEFAULT 0",
+                    "ALTER TABLE team_cycle_state ADD COLUMN team_close_seq INTEGER NOT NULL DEFAULT 0",
+                    "ALTER TABLE team_cycle_state ADD COLUMN worker_close_seq INTEGER NOT NULL DEFAULT 0",
+                ):
+                    try:
+                        conn.execute(ddl)
+                    except Exception as exc:
+                        # SQLite raises OperationalError("duplicate column name")
+                        # when the column already exists. Anything else is a
+                        # real schema problem worth surfacing — but never a
+                        # reason to crash the bridge.
+                        if "duplicate column" not in str(exc).lower():
+                            logger.warning(
+                                "[CYCLE] migration %r failed: %s",
+                                ddl, exc, exc_info=True,
+                            )
+        except Exception as e:
+            logger.warning("[CYCLE] _ensure_event_tables failed: %s", e, exc_info=True)
+
+    def _load_cycle_state(self, session_id: str) -> dict:
+        """Return cycle state for the session.
+
+        Keys:
+          * ``worker_open`` — bool, any non-orchestrator member is ``running``
+          * ``orch_running`` — bool, the team's orchestrator
+            (per ``template.orchestrator``) is ``running``
+          * ``team_open`` — bool, legacy ``any(spawned running)``; kept
+            for backward compat with the existing column, do NOT use
+            for the full-cycle-close gating.
+
+        Defaults to all-closed when no row exists — first event after
+        spawn will update to open and persist.
+
+        ``team_open`` is retained as a column but is no longer the
+        gating signal for ``full_cycle_closed`` — see the 2026-05-19
+        incident write-up in ``_ensure_event_tables`` for why.
+        """
+        try:
+            from core.agent_registry_db import _connect
+
+            with _connect() as conn:
+                row = conn.execute(
+                    """SELECT worker_open, team_open, orch_running
+                       FROM team_cycle_state WHERE session_id = ?""",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    return {
+                        "worker_open": False,
+                        "team_open": False,
+                        "orch_running": False,
+                    }
+                return {
+                    "worker_open": bool(row["worker_open"]),
+                    "team_open": bool(row["team_open"]),
+                    "orch_running": bool(row["orch_running"]),
+                }
+        except Exception as e:
+            logger.warning("[CYCLE] _load_cycle_state(%s) failed: %s", session_id, e)
+            return {
+                "worker_open": False,
+                "team_open": False,
+                "orch_running": False,
+            }
+
+    def _save_cycle_state(
+        self,
+        session_id: str,
+        worker_open: bool,
+        team_open: bool,
+        orch_running: bool,
+    ) -> None:
+        """Persist the post-event cycle snapshot.
+
+        Called AFTER ``_try_close_team_cycle`` / ``_try_close_worker_cycle``
+        — those helpers handle the close transitions atomically. This
+        function exists for the non-close paths (reopen, no-change).
+        """
+        try:
+            import time
+            from core.agent_registry_db import _connect
+
+            with _connect() as conn:
+                conn.execute(
+                    """INSERT INTO team_cycle_state
+                          (session_id, worker_open, team_open, orch_running, updated_at)
+                       VALUES(?, ?, ?, ?, ?)
+                       ON CONFLICT(session_id) DO UPDATE SET
+                         worker_open   = excluded.worker_open,
+                         team_open     = excluded.team_open,
+                         orch_running  = excluded.orch_running,
+                         updated_at    = excluded.updated_at""",
+                    (
+                        session_id,
+                        int(worker_open),
+                        int(team_open),
+                        int(orch_running),
+                        time.time(),
+                    ),
+                )
+        except Exception as e:
+            logger.warning("[CYCLE] _save_cycle_state(%s) failed: %s", session_id, e)
+
+    def _try_close_team_cycle(
+        self,
+        session_id: str,
+        new_worker_open: bool,
+        new_team_open: bool,
+        new_orch_running: bool,
+    ) -> int | None:
+        """Atomically close the team cycle for ``session_id`` if and only
+        if the orchestrator just transitioned ``running → not-running``.
+
+        The gating predicate ``WHERE orch_running = 1`` is the only place
+        in the code that decides "is this caller the canonical close
+        handler for this cycle?". Two concurrent callers observing the
+        same transition will race to this UPDATE; SQLite serialises
+        them, so only the first sees ``WHERE`` match → returns the new
+        ``team_close_seq``. The loser sees 0 rows updated → returns
+        ``None`` → caller skips the notify side effect.
+
+        This is the *only* primitive that should ever raise the team
+        close_seq counter or persist ``orch_running = 0``.
+
+        Returns the new ``team_close_seq`` if this caller won the close,
+        otherwise ``None``.
+        """
+        if new_orch_running:
+            return None
+        try:
+            import time
+            from core.agent_registry_db import _connect
+
+            with _connect() as conn:
+                cur = conn.execute(
+                    """UPDATE team_cycle_state
+                       SET team_close_seq = team_close_seq + 1,
+                           orch_running   = 0,
+                           worker_open    = ?,
+                           team_open      = ?,
+                           updated_at     = ?
+                       WHERE session_id = ? AND orch_running = 1
+                       RETURNING team_close_seq""",
+                    (
+                        int(new_worker_open),
+                        int(new_team_open),
+                        time.time(),
+                        session_id,
+                    ),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return int(row[0])
+        except Exception as exc:
+            logger.warning(
+                "[CYCLE] _try_close_team_cycle(%s) failed: %s",
+                session_id, exc, exc_info=True,
+            )
+            return None
+
+    def _try_close_worker_cycle(
+        self,
+        session_id: str,
+        new_worker_open: bool,
+        new_team_open: bool,
+        new_orch_running: bool,
+    ) -> int | None:
+        """Atomically close the worker cycle for ``session_id`` if the
+        last non-orchestrator member just stopped running.
+
+        Same race-free protocol as :py:meth:`_try_close_team_cycle`. The
+        WHERE predicate is ``worker_open = 1`` — only the caller that
+        flips it to 0 wins.
+
+        Returns the new ``worker_close_seq`` if this caller won, else
+        ``None``.
+        """
+        if new_worker_open:
+            return None
+        try:
+            import time
+            from core.agent_registry_db import _connect
+
+            with _connect() as conn:
+                cur = conn.execute(
+                    """UPDATE team_cycle_state
+                       SET worker_close_seq = worker_close_seq + 1,
+                           worker_open      = 0,
+                           team_open        = ?,
+                           orch_running     = ?,
+                           updated_at       = ?
+                       WHERE session_id = ? AND worker_open = 1
+                       RETURNING worker_close_seq""",
+                    (
+                        int(new_team_open),
+                        int(new_orch_running),
+                        time.time(),
+                        session_id,
+                    ),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return int(row[0])
+        except Exception as exc:
+            logger.warning(
+                "[CYCLE] _try_close_worker_cycle(%s) failed: %s",
+                session_id, exc, exc_info=True,
+            )
+            return None
+
+    def _insert_event(
+        self, event_id: str, event_type: str,
+        session_id: str, team_name: str, payload: dict,
+    ) -> bool:
+        """INSERT … ON CONFLICT DO NOTHING. Returns True iff the row was
+        newly inserted (i.e. caller should run side effects). False on
+        conflict or error — caller must skip downstream notifications.
+        """
+        try:
+            import time
+            from core.agent_registry_db import _connect
+
+            with _connect() as conn:
+                cur = conn.execute(
+                    """INSERT INTO team_events(event_id, event_type, session_id, team_name, payload_json, created_at)
+                       VALUES(?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(event_id) DO NOTHING""",
+                    (event_id, event_type, session_id, team_name,
+                     json.dumps(payload), time.time()),
+                )
+                return cur.rowcount > 0
+        except Exception as e:
+            logger.warning(
+                "[CYCLE] _insert_event(%s) failed: %s", event_id, e, exc_info=True,
+            )
+            return False
+
+    def _on_member_state_event(self, run_id: str) -> None:
+        """Single entry point for status-changing events.
+
+        Pure transition detector:
+
+          1. Load registry record for ``run_id`` → resolve ``session_id``
+             and ``team_name`` (skip for solo agents).
+          2. Snapshot current cycle state from the registry:
+               - ``worker_open``  — any non-orchestrator member running
+               - ``orch_running`` — the orchestrator (per
+                 ``template.orchestrator``) is running
+               - ``team_open``    — legacy "any spawned member running",
+                 kept for observability but NOT the gating signal.
+          3. Compare against the last persisted cycle state and emit:
+               - ``worker_cycle_closed`` when ``worker_open`` flips T→F
+               - ``full_cycle_closed``  when ``orch_running`` flips T→F
+                 AND no workers running AND no active meetings
+          4. Atomic close primitives (``_try_close_*_cycle``) own the
+             post-close state update AND the close_seq increment, so a
+             race between two callers observing the same transition
+             produces exactly one notify (the WHERE predicate matches
+             only the first caller).
+          5. For non-close paths (reopen / no-change), persist the new
+             snapshot via ``_save_cycle_state``.
+
+        Why ``orch_running`` and not ``team_open``? Incident 2026-05-19:
+        with ``team_open = any(spawned running)``, the bridge fired
+        ``full_cycle_closed`` the moment the last worker idled — even
+        though the orchestrator was already idle and had not yet had a
+        chance to process the worker reports pushed via
+        ``_trigger_orchestrator_resume``. The orchestrator was then
+        woken, did its post-cycle work, and idled again → a second,
+        valid ``full_cycle_closed`` fired → user saw 2 notifications.
+        Gating on the orchestrator's OWN transition makes
+        ``full_cycle_closed`` mean exactly "the orchestrator finished
+        its turn after acknowledging workers" — which is what the user
+        is being notified about.
+        """
+        if not self._registry_db:
+            return
+
+        record = self._registry_db.get_record(run_id)
+        if not record:
+            return
+        session_id = record.get("session_id", "")
+        team_name = record.get("team_name", "")
+        if not session_id or not team_name:
+            return  # Solo agent or pre-session record — not in scope
+
+        # Dedupe by agent_name, keep ONLY the latest run per agent. The
+        # registry uses ``run_id`` as primary key and resumable agents
+        # (the orchestrator in particular) get a NEW row on every
+        # resume — so over N injects the orchestrator accumulates N
+        # rows. Without this dedupe, ``len(members)`` and the "running"
+        # check both treat each historical row as a distinct member.
+        # Side effects observed in incident 2026-05-17 notif #28:
+        #   * "16 agents" instead of 7 (10 stale orchestrator rows + 6
+        #     worker rows).
+        #   * Premature full_cycle_closed: only the latest orchestrator
+        #     run is actually running at any time; the 9 stale rows are
+        #     idle. With dedupe, ``orch_running = (latest orchestrator
+        #     row is running)`` — which correctly stays True while it
+        #     is mid-turn.
+        # Tie-break: highest ``started_at`` wins; ``last_active_at``
+        # would also work but ``started_at`` is monotonic per row
+        # creation, so it's the safer monotonic ordering for "latest
+        # spawn".
+        raw_members = [
+            m for m in self._registry_db.find_by_team_name(team_name)
+            if m.get("session_id") == session_id
+        ]
+        latest_by_name: dict[str, dict] = {}
+        for m in raw_members:
+            name = m.get("agent_name", "")
+            if not name:
+                continue
+            started = m.get("started_at", 0) or 0
+            prev_row = latest_by_name.get(name)
+            if prev_row is None or (prev_row.get("started_at", 0) or 0) < started:
+                latest_by_name[name] = m
+        members = list(latest_by_name.values())
+        if not members:
+            return
+
+        orch = self._find_orchestrator(members, session_id=session_id)
+        orch_name = orch.get("agent_name", "") if orch else ""
+        # ``available`` = registered but not spawned yet; ``None`` = legacy
+        # rows. Exclude both from cycle calculations — they are not
+        # transitionable states.
+        spawned = [
+            m for m in members
+            if m.get("status") not in ("available", None)
+        ]
+        workers = [m for m in spawned if m.get("agent_name") != orch_name]
+
+        worker_open = any(m.get("status") == "running" for m in workers)
+        team_open = any(m.get("status") == "running" for m in spawned)
+        orch_running = bool(orch and orch.get("status") == "running")
+
+        prev = self._load_cycle_state(session_id)
+
+        # ── Worker cycle close ──
+        # Atomic: WHERE worker_open=1 lets exactly one concurrent caller
+        # take the close, and increments worker_close_seq for a stable
+        # event_id. Loser callers see ``close_seq is None`` → skip emit.
+        worker_close_seq: int | None = None
+        if prev["worker_open"] and not worker_open:
+            worker_close_seq = self._try_close_worker_cycle(
+                session_id, worker_open, team_open, orch_running,
+            )
+            if worker_close_seq is not None:
+                self._emit_worker_cycle_closed(
+                    session_id, team_name, members, orch, workers,
+                    close_seq=worker_close_seq,
+                )
+
+        # ── Full cycle close ──
+        # Gate on the orchestrator's own transition, NOT on
+        # ``team_open``. See docstring incident 2026-05-19.
+        team_close_seq: int | None = None
+        if prev["orch_running"] and not orch_running and not worker_open:
+            # Meeting-aware: if any member is still mid-meeting, the
+            # team is NOT truly idle — defer the close. Meeting end
+            # events will re-trigger the handler and the next pass will
+            # fire.
+            member_names = {m.get("agent_name", "") for m in spawned}
+            if not self._active_meetings_with_members(member_names):
+                team_close_seq = self._try_close_team_cycle(
+                    session_id, worker_open, team_open, orch_running,
+                )
+                if team_close_seq is not None:
+                    self._emit_full_cycle_closed(
+                        session_id, team_name, members, orch,
+                        close_seq=team_close_seq,
+                    )
+
+        # ── Non-close path: persist new snapshot ──
+        # Atomic close helpers already updated the row on the close
+        # path; only run the upsert when neither close fired. Keeps the
+        # "one writer per event" invariant tight.
+        if worker_close_seq is None and team_close_seq is None:
+            self._save_cycle_state(
+                session_id, worker_open, team_open, orch_running,
+            )
+
+    def _emit_worker_cycle_closed(
+        self, session_id: str, team_name: str,
+        members: list[dict], orch: dict | None, workers: list[dict],
+        *, close_seq: int,
+    ) -> None:
+        """Orchestrator-facing event: ALL non-orchestrator members have
+        stopped running.
+
+        Sends the consolidated worker status to the orchestrator's
+        inbox so it can decide the next round. If the orchestrator is
+        currently idle, also triggers ``resume_with_inject`` so it
+        wakes to process it.
+
+        ``close_seq`` is the canonical worker-close sequence number
+        (incremented atomically by :py:meth:`_try_close_worker_cycle`).
+        It is embedded into the event_id PK so concurrent callers
+        observing the same close cannot generate distinct event_ids
+        (the old uuid-based key silently defeated PK conflict dedupe —
+        incident 2026-05-19).
+        """
+        if not orch:
+            return
+        event_id = f"{session_id}:worker_cycle_closed:{close_seq}"
+        if not self._insert_event(
+            event_id, "worker_cycle_closed", session_id, team_name,
+            {"workers": [
+                {"agent_name": w.get("agent_name"),
+                 "status": w.get("status"),
+                 "run_id": w.get("run_id")} for w in workers
+            ]},
+        ):
+            return  # Conflict — another caller already emitted this close.
+
+        orch_name = orch.get("agent_name", "")
+        report = self._format_worker_status_report(workers, orch_name)
+        messages_dir = self._resolve_messages_dir(members)
+        if not messages_dir:
+            logger.warning(
+                "[CYCLE] worker_cycle_closed for %s: no messages_dir resolvable",
+                team_name,
+            )
+            return
+        try:
+            from fast_agent.spawn.message_bus import MessageBus
+
+            MessageBus(messages_dir=messages_dir).send(
+                from_name="System",
+                to_name=orch_name,
+                content=report,
+                message_type="notification",
+                priority="high",
+            )
+            logger.info(
+                "[CYCLE] worker_cycle_closed → %s (%d workers, team=%s, event=%s)",
+                orch_name, len(workers), team_name, event_id,
+            )
+        except Exception as e:
+            logger.warning("[CYCLE] worker_cycle_closed send failed: %s", e, exc_info=True)
+            return
+
+        # If the orchestrator is idle, resume so the inbox notification
+        # is consumed. This is the contract the team flow expects: a
+        # worker_cycle close MUST give the orchestrator a turn — that
+        # turn is what later transitions ``orch_running`` False→True
+        # then True→False, which is the canonical full_cycle_closed
+        # trigger.
+        if orch.get("status") in ("idle", "completed", "error", "timeout", "cancelled"):
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._trigger_orchestrator_resume(orch, team_name))
+            except RuntimeError:
+                logger.warning(
+                    "[CYCLE] No event loop — cannot resume idle orchestrator %s",
+                    orch_name,
+                )
+
+    def _emit_full_cycle_closed(
+        self, session_id: str, team_name: str,
+        members: list[dict], orch: dict | None,
+        *, close_seq: int,
+    ) -> None:
+        """User-facing event: the orchestrator has just finished its
+        post-worker turn and the team has nothing pending. Creates a
+        UI notification via the existing ``_create_team_notification``
+        helper (which preserves meeting-aware framing and SSE
+        broadcast).
+
+        ``close_seq`` is the canonical team-close sequence number
+        (incremented atomically by :py:meth:`_try_close_team_cycle`).
+        Embedded into the event_id PK to make concurrent emits idempotent.
+        """
+        event_id = f"{session_id}:full_cycle_closed:{close_seq}"
+        if not self._insert_event(
+            event_id, "full_cycle_closed", session_id, team_name,
+            {"members": [
+                {"agent_name": m.get("agent_name"),
+                 "status": m.get("status"),
+                 "run_id": m.get("run_id")} for m in members
+            ]},
+        ):
+            return
+
+        result_text = orch.get("result", "") if orch else ""
+        orch_name = orch.get("agent_name", team_name) if orch else team_name
+        spawned = [
+            m for m in members
+            if m.get("status") not in ("available", None)
+        ]
+        self._create_team_notification(
+            team_name, orch_name, result_text, spawned,
+            session_id=session_id,
+        )
+        logger.info(
+            "[CYCLE] full_cycle_closed → user notify (team=%s, event=%s)",
+            team_name, event_id,
+        )
+
+    def _format_worker_status_report(
+        self, workers: list[dict], orch_name: str,
+    ) -> str:
+        """Build the markdown status report sent to the orchestrator's inbox on
+        ``worker_cycle_closed``. Preserves the meeting-aware framing
+        from the prior implementation (b61af7db incident) — if a member
+        is still mid-meeting the header reframes to "NOT done".
+        """
+        status_icons = {
+            "idle": "✅", "completed": "✅",
+            "error": "❌", "timeout": "⏰", "cancelled": "🚫",
+        }
+        member_names = {w.get("agent_name", "") for w in workers if w.get("agent_name")}
+        member_names.add(orch_name)
+        active_meetings = self._active_meetings_with_members(member_names)
+
+        if active_meetings:
+            header = (
+                f"⏳ **Team Status Update** — members are idle but "
+                f"{len(active_meetings)} meeting(s) still open. Team is NOT done."
+            )
+        else:
+            header = "📋 **Team Status Update** — All members have finished."
+        lines = [header, "", "| Member | Status | Summary |", "|--------|--------|---------|"]
+        for w in workers:
+            name = w.get("agent_name", "?")
+            status = w.get("status", "?")
+            icon = status_icons.get(status, "❓")
+            if status == "error":
+                summary = (w.get("error", "") or "Unknown error")[:80]
+            else:
+                summary = (w.get("result", "") or "No output")[:80]
+            summary = summary.replace("\n", " ").replace("|", "/").strip()
+            lines.append(f"| {name} | {icon} {status} | {summary} |")
+        if active_meetings:
+            lines.append(self._format_active_meetings_warning(active_meetings))
+        else:
+            lines.append("\nReview outputs and decide next actions.")
+        return "\n".join(lines)
+

@@ -1,0 +1,70 @@
+from __future__ import annotations
+
+from fast_agent.skills.marketplace_parsing import parse_marketplace_payload
+
+
+def test_parse_marketplace_payload_derives_fallback_name_from_repo_path_leaf() -> None:
+    payload = {
+        "entries": [
+            {
+                "repo_url": "https://github.com/example/skills",
+                "repo_path": "skills/alpha",
+            }
+        ]
+    }
+
+    skills = parse_marketplace_payload(payload)
+
+    assert len(skills) == 1
+    assert skills[0].name == "alpha"
+
+
+def test_parse_marketplace_payload_expands_plugin_bundle_entries() -> None:
+    payload = {
+        "metadata": {"pluginRoot": "bundles"},
+        "plugins": [
+            {
+                "name": "Useful Bundle",
+                "description": "Helpful tools",
+                "source": {
+                    "source": "github",
+                    "repo": "example/skills",
+                    "ref": "main",
+                    "path": "bundle-root",
+                },
+                "skills": ["alpha", "nested/beta"],
+            }
+        ],
+    }
+
+    skills = parse_marketplace_payload(payload)
+
+    assert [skill.name for skill in skills] == ["alpha", "beta"]
+    assert [skill.repo_path for skill in skills] == [
+        "bundles/bundle-root/alpha",
+        "bundles/bundle-root/nested/beta",
+    ]
+    assert all(skill.repo_url == "https://github.com/example/skills" for skill in skills)
+    assert all(skill.bundle_name == "Useful Bundle" for skill in skills)
+
+
+def test_parse_marketplace_payload_does_not_label_unexpanded_plugin_as_bundle() -> None:
+    payload = {
+        "plugins": [
+                {
+                    "name": "session-investigator",
+                    "description": "Investigate sessions",
+                    "source": {
+                        "source": "github",
+                        "repo": "example/skills",
+                        "path": "skills/session-investigator",
+                    },
+                }
+        ],
+    }
+
+    skills = parse_marketplace_payload(payload)
+
+    assert len(skills) == 1
+    assert skills[0].name == "session-investigator"
+    assert skills[0].bundle_name is None

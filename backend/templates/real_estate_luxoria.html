@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth" id="html-root">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ business_name }} • Luxoria Signature Residences</title>
+  <meta name="description" content="{{ tagline }} Located in {{ location }}." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,600;0,700;1,400&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Syne:wght@500;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          fontFamily: {
+            display: ['"Syne"', 'sans-serif'],
+            serif: ['"Playfair Display"', 'serif'],
+            sans: ['"Plus Jakarta Sans"', 'sans-serif'],
+          },
+          colors: {
+            bronzeGold: { 400: '#d9bc94', 500: '#c5a880', 600: '#a38760' },
+            obsidian: '#090a0f',
+            cardDark: '#11131c',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    .glass-nav {
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+    }
+    .hover-lift {
+      transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1), box-shadow 0.4s ease;
+    }
+    .hover-lift:hover {
+      transform: translateY(-8px);
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+    }
+    /* Scroll-Driven Viewport Reveals */
+    .reveal {
+      opacity: 0;
+      transform: translateY(36px);
+      transition: opacity 0.9s cubic-bezier(0.16, 1, 0.3, 1), transform 0.9s cubic-bezier(0.16, 1, 0.3, 1);
+      will-change: opacity, transform;
+    }
+    .reveal.active {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .reveal-delay-1 { transition-delay: 0.15s; }
+    .reveal-delay-2 { transition-delay: 0.3s; }
+    .reveal-delay-3 { transition-delay: 0.45s; }
+  </style>
+</head>
+<body class="font-sans bg-[#faf8f5] dark:bg-[#090a0f] text-[#12141d] dark:text-[#f1f3f9] antialiased transition-colors duration-300">
+
+  <!-- TOP TICKER BAR -->
+  <div class="bg-black text-white text-xs py-2.5 px-4 border-b border-white/10">
+    <div class="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-2 text-center sm:text-left">
+      <div class="flex items-center gap-3">
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+        <span class="font-display tracking-widest uppercase text-[10px]">Luxoria Signature Portfolio • Private Sales Active for {{ location }}</span>
+      </div>
+      <div class="flex items-center gap-5 text-[11px] text-neutral-400">
+        <span><i class="fa-solid fa-phone me-1.5 text-bronzeGold-500"></i>{{ phone_number }}</span>
+        <span><i class="fa-solid fa-location-dot me-1.5 text-bronzeGold-500"></i>{{ location }}</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- NAVIGATION (Luxoria Glassmorphism) -->
+  <nav class="sticky top-0 z-40 glass-nav bg-[#faf8f5]/85 dark:bg-[#090a0f]/85 border-b border-black/5 dark:border-white/10 transition-colors">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex items-center justify-between">
+      <a href="#" class="flex items-center gap-3">
+        <div class="w-11 h-11 rounded-2xl bg-black dark:bg-white text-white dark:text-black flex items-center justify-center font-display font-bold text-xl shadow-md">
+          <i class="fa-solid fa-gem"></i>
+        </div>
+        <div>
+          <span class="font-display font-bold text-2xl tracking-tight block leading-none">{{ business_name }}</span>
+          <span class="text-[10px] uppercase tracking-[0.25em] text-neutral-500 font-semibold block mt-1">Signature Living</span>
+        </div>
+      </a>
+
+      <!-- Desktop Links -->
+      <div class="hidden lg:flex items-center gap-8 text-sm font-semibold tracking-wide">
+        <a href="#about" class="hover:text-bronzeGold-500 transition">Heritage</a>
+        <a href="#properties" class="hover:text-bronzeGold-500 transition">Signature Residences</a>
+        <a href="#amenities" class="hover:text-bronzeGold-500 transition">Private Amenities</a>
+        <a href="#services" class="hover:text-bronzeGold-500 transition">Services</a>
+        <a href="#inquiry" class="hover:text-bronzeGold-500 transition">Private Inspection</a>
+      </div>
+
+      <!-- Action Area -->
+      <div class="flex items-center gap-3">
+        <!-- 1-Click Dark/Light Switcher -->
+        <button id="theme-toggle" class="w-10 h-10 rounded-full border border-black/10 dark:border-white/15 flex items-center justify-center hover:text-bronzeGold-500 transition" title="Toggle Light/Dark Theme">
+          <i class="fa-solid fa-moon dark:hidden text-neutral-700"></i>
+          <i class="fa-solid fa-sun hidden dark:block text-bronzeGold-400"></i>
+        </button>
+
+        <a href="https://wa.me/{{ clean_phone }}?text=Hello%20{{ business_name }},%20I%20would%20like%20to%20inquire%20about%20your%20Luxoria%20Signature%20Residences." target="_blank" class="hidden sm:inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-black dark:bg-white hover:bg-neutral-800 dark:hover:bg-neutral-200 text-white dark:text-black font-semibold text-xs tracking-wider uppercase transition shadow-lg">
+          <i class="fa-brands fa-whatsapp text-emerald-400 text-sm"></i>
+          <span>VIP Concierge</span>
+        </a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- HERO SECTION (Luxoria Signature Hero) -->
+  <section class="relative min-h-[90vh] flex items-center justify-center overflow-hidden">
+    <div class="absolute inset-0 z-0">
+      <img src="https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?auto=format&fit=crop&w=1920&q=85" alt="Luxoria Architecture" class="w-full h-full object-cover scale-105 transition duration-1000" />
+      <div class="absolute inset-0 bg-gradient-to-t from-[#faf8f5] dark:from-[#090a0f] via-black/55 to-black/75"></div>
+    </div>
+
+    <div class="relative z-10 max-w-5xl mx-auto px-4 py-24 text-center text-white space-y-6">
+      <div class="reveal inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-white/10 backdrop-blur-md border border-white/20 text-bronzeGold-400 text-xs uppercase tracking-widest font-display">
+        <i class="fa-solid fa-crown text-xs"></i>
+        <span>Luxoria Private Estates • {{ location }}</span>
+      </div>
+
+      <h1 class="reveal reveal-delay-1 font-serif text-4xl sm:text-6xl md:text-7xl font-bold tracking-tight leading-[1.08]">
+        Architectural Marvels <br />
+        <span class="italic font-normal text-bronzeGold-400">For Connoisseurs of Distinction</span>
+      </h1>
+
+      <p class="reveal reveal-delay-2 max-w-2xl mx-auto text-base sm:text-lg text-neutral-200 font-light leading-relaxed">
+        {{ tagline }} Discover ultra-exclusive private estates, hilltop sky villas, and waterfront sanctuaries crafted with European precision in {{ location }}.
+      </p>
+
+      <div class="reveal reveal-delay-3 flex flex-col sm:flex-row items-center justify-center gap-4 pt-4">
+        <a href="#properties" class="w-full sm:w-auto px-8 py-4 rounded-full bg-bronzeGold-500 hover:bg-bronzeGold-600 text-black font-bold text-xs uppercase tracking-wider transition shadow-xl">
+          Explore Residences
+        </a>
+        <a href="#inquiry" class="w-full sm:w-auto px-8 py-4 rounded-full bg-white/10 hover:bg-white/20 backdrop-blur-md border border-white/30 text-white font-semibold text-xs uppercase tracking-wider transition">
+          Schedule Private Tour
+        </a>
+      </div>
+
+      <!-- Trust Credentials Counter -->
+      <div class="reveal pt-12 grid grid-cols-2 md:grid-cols-4 gap-6 max-w-3xl mx-auto border-t border-white/15">
+        <div>
+          <div class="font-display text-3xl sm:text-4xl font-bold text-bronzeGold-400" data-counter-target="75" data-counter-prefix="₦" data-counter-suffix="B+">₦0B+</div>
+          <div class="text-[10px] uppercase tracking-widest text-neutral-300 font-display mt-1">Portfolio Delivered</div>
+        </div>
+        <div>
+          <div class="font-display text-3xl sm:text-4xl font-bold text-bronzeGold-400" data-counter-target="100" data-counter-suffix="%">0%</div>
+          <div class="text-[10px] uppercase tracking-widest text-neutral-300 font-display mt-1">C of O Perfected</div>
+        </div>
+        <div>
+          <div class="font-display text-3xl sm:text-4xl font-bold text-bronzeGold-400" data-counter-target="22" data-counter-suffix="+">0+</div>
+          <div class="text-[10px] uppercase tracking-widest text-neutral-300 font-display mt-1">Global Awards</div>
+        </div>
+        <div>
+          <div class="font-display text-3xl sm:text-4xl font-bold text-bronzeGold-400" data-counter-target="99.6" data-counter-suffix="%">0%</div>
+          <div class="text-[10px] uppercase tracking-widest text-neutral-300 font-display mt-1">Satisfaction Score</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SEARCH & FILTER BAR -->
+  <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 -mt-8 relative z-20">
+    <div class="reveal bg-white dark:bg-cardDark p-6 sm:p-8 rounded-3xl shadow-2xl border border-black/10 dark:border-white/10">
+      <form onsubmit="handleLuxoriaSearch(event)" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <div>
+          <label class="block text-xs font-semibold uppercase tracking-wider text-neutral-500 mb-2">Prime District</label>
+          <select id="lux_loc" class="w-full px-4 py-3 rounded-2xl bg-neutral-100 dark:bg-neutral-800/60 border border-black/5 dark:border-white/10 text-sm font-semibold focus:outline-none focus:border-bronzeGold-500">
+            <option value="all">All Districts ({{ location }})</option>
+            <option value="maitama">Maitama Prime Diplomatic</option>
+            <option value="guzape">Guzape Skyline Hills</option>
+            <option value="asokoro">Asokoro Diplomatic Quarter</option>
+            <option value="jabi">Jabi Lake Waterfront</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-xs font-semibold uppercase tracking-wider text-neutral-500 mb-2">Residence Type</label>
+          <select id="lux_type" class="w-full px-4 py-3 rounded-2xl bg-neutral-100 dark:bg-neutral-800/60 border border-black/5 dark:border-white/10 text-sm font-semibold focus:outline-none focus:border-bronzeGold-500">
+            <option value="all">All Residence Types</option>
+            <option value="mansion">Palatial Mansions</option>
+            <option value="penthouse">Skyline Penthouses</option>
+            <option value="waterfront">Waterfront Villas</option>
+          </select>
+        </div>
+
+        <div>
+          <label class="block text-xs font-semibold uppercase tracking-wider text-neutral-500 mb-2">Investment Bracket</label>
+          <select id="lux_price" class="w-full px-4 py-3 rounded-2xl bg-neutral-100 dark:bg-neutral-800/60 border border-black/5 dark:border-white/10 text-sm font-semibold focus:outline-none focus:border-bronzeGold-500">
+            <option value="all">Any Investment Scale</option>
+            <option value="sub1b">Under ₦1.0 Billion</option>
+            <option value="1b-2b">₦1.0 Billion – ₦2.5 Billion</option>
+            <option value="above2b">₦2.5 Billion & Above</option>
+          </select>
+        </div>
+
+        <div class="flex items-end">
+          <button type="submit" class="w-full py-3.5 rounded-2xl bg-black dark:bg-white hover:bg-neutral-800 dark:hover:bg-neutral-200 text-white dark:text-black font-bold text-xs uppercase tracking-wider transition shadow-lg flex items-center justify-center gap-2">
+            <i class="fa-solid fa-magnifying-glass"></i>
+            <span>Search Residences</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <!-- FEATURED RESIDENCES (Luxoria Cards) -->
+  <section id="properties" class="py-24 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+    <div class="flex flex-col md:flex-row md:items-end justify-between mb-16">
+      <div>
+        <span class="text-xs uppercase tracking-[0.25em] text-bronzeGold-500 font-display font-semibold block mb-2">The Collection</span>
+        <h2 class="font-serif text-3xl sm:text-5xl font-bold tracking-tight">Curated Masterpieces</h2>
+      </div>
+
+      <div class="flex items-center gap-2 mt-6 md:mt-0 overflow-x-auto pb-2" id="lux-tabs">
+        <button class="lux-tab active px-5 py-2 rounded-full text-xs font-bold uppercase tracking-wider bg-black dark:bg-white text-white dark:text-black transition" onclick="filterLuxTab('all', this)">All</button>
+        <button class="lux-tab px-5 py-2 rounded-full text-xs font-bold uppercase tracking-wider bg-black/5 dark:bg-white/10 hover:bg-black/10 transition" onclick="filterLuxTab('mansion', this)">Mansions</button>
+        <button class="lux-tab px-5 py-2 rounded-full text-xs font-bold uppercase tracking-wider bg-black/5 dark:bg-white/10 hover:bg-black/10 transition" onclick="filterLuxTab('penthouse', this)">Penthouses</button>
+        <button class="lux-tab px-5 py-2 rounded-full text-xs font-bold uppercase tracking-wider bg-black/5 dark:bg-white/10 hover:bg-black/10 transition" onclick="filterLuxTab('waterfront', this)">Waterfront</button>
+      </div>
+    </div>
+
+    <!-- Properties Grid -->
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8" id="lux-properties-grid">
+
+      <!-- Card 1 -->
+      <div class="reveal lux-card mansion bg-white dark:bg-cardDark rounded-3xl overflow-hidden border border-black/10 dark:border-white/10 shadow-lg hover-lift">
+        <div class="relative h-72 overflow-hidden">
+          <img src="https://images.unsplash.com/photo-1600585154340-be6161a56a0c?auto=format&fit=crop&w=800&q=85" alt="Villa Bel Air" class="w-full h-full object-cover transition duration-700 hover:scale-105" />
+          <div class="absolute top-4 left-4 px-3 py-1 rounded-full bg-black/70 backdrop-blur-md text-white text-[10px] font-display uppercase tracking-widest">Maitama Diplomatic</div>
+          <div class="absolute top-4 right-4 px-3 py-1 rounded-full bg-emerald-500 text-black font-bold text-xs uppercase">Available</div>
+        </div>
+        <div class="p-6">
+          <div class="flex justify-between items-baseline mb-2">
+            <h3 class="font-serif text-2xl font-bold">The Royal Imperial Villa</h3>
+            <span class="font-serif font-bold text-xl text-bronzeGold-500">₦2.15B</span>
+          </div>
+          <p class="text-xs text-neutral-500 dark:text-neutral-400 mb-6">Palatial 8-bedroom ambassadorial villa with private infinity pool, elevator & biometric security perimeter.</p>
+          <div class="flex items-center justify-between border-t border-black/10 dark:border-white/10 pt-4 text-xs font-semibold text-neutral-600 dark:text-neutral-300">
+            <span><i class="fa-solid fa-bed me-1.5 text-bronzeGold-500"></i>8 Beds</span>
+            <span><i class="fa-solid fa-bath me-1.5 text-bronzeGold-500"></i>9 Baths</span>
+            <span><i class="fa-solid fa-vector-square me-1.5 text-bronzeGold-500"></i>1,850 sqm</span>
+          </div>
+          <button onclick="openLuxModal('The Royal Imperial Villa', '₦2.15B', 'Maitama Diplomatic, Abuja', '8 Beds • 9 Baths • 1,850 sqm • Infinity Pool • Lift', 'https://images.unsplash.com/photo-1600585154340-be6161a56a0c?auto=format&fit=crop&w=800&q=85')" class="mt-6 w-full py-3 rounded-2xl bg-neutral-100 dark:bg-white/10 hover:bg-black hover:text-white dark:hover:bg-white dark:hover:text-black font-bold text-xs uppercase tracking-wider transition">
+            View Floor Plan & Specs
+          </button>
+        </div>
+      </div>
+
+      <!-- Card 2 -->
+      <div class="reveal reveal-delay-1 lux-card penthouse bg-white dark:bg-cardDark rounded-3xl overflow-hidden border border-black/10 dark:border-white/10 shadow-lg hover-lift">
+        <div class="relative h-72 overflow-hidden">
+          <img src="https://images.unsplash.com/photo-1600607687939-ce8a6c25118c?auto=format&fit=crop&w=800&q=85" alt="Sky Penthouse" class="w-full h-full object-cover transition duration-700 hover:scale-105" />
+          <div class="absolute top-4 left-4 px-3 py-1 rounded-full bg-black/70 backdrop-blur-md text-white text-[10px] font-display uppercase tracking-widest">Guzape Hills</div>
+          <div class="absolute top-4 right-4 px-3 py-1 rounded-full bg-bronzeGold-500 text-black font-bold text-xs uppercase">Private Sale</div>
+        </div>
+        <div class="p-6">
+          <div class="flex justify-between items-baseline mb-2">
+            <h3 class="font-serif text-2xl font-bold">Celeste Skyline Penthouse</h3>
+            <span class="font-serif font-bold text-xl text-bronzeGold-500">₦1.1B</span>
+          </div>
+          <p class="text-xs text-neutral-500 dark:text-neutral-400 mb-6">360-degree hilltop city panoramas, private heated rooftop plunge pool & custom Italian marble kitchen.</p>
+          <div class="flex items-center justify-between border-t border-black/10 dark:border-white/10 pt-4 text-xs font-semibold text-neutral-600 dark:text-neutral-300">
+            <span><i class="fa-solid fa-bed me-1.5 text-bronzeGold-500"></i>5 Beds</span>
+            <span><i class="fa-solid fa-bath me-1.5 text-bronzeGold-500"></i>6 Baths</span>
+            <span><i class="fa-solid fa-vector-square me-1.5 text-bronzeGold-500"></i>940 sqm</span>
+          </div>
+          <button onclick="openLuxModal('Celeste Skyline Penthouse', '₦1.1B', 'Guzape Hills, Abuja', '5 Beds • 6 Baths • 940 sqm • Rooftop Pool • 360 View', 'https://images.unsplash.com/photo-1600607687939-ce8a6c25118c?auto=format&fit=crop&w=800&q=85')" class="mt-6 w-full py-3 rounded-2xl bg-neutral-100 dark:bg-white/10 hover:bg-black hover:text-white dark:hover:bg-white dark:hover:text-black font-bold text-xs uppercase tracking-wider transition">
+            View Floor Plan & Specs
+          </button>
+        </div>
+      </div>
+
+      <!-- Card 3 -->
+      <div class="reveal reveal-delay-2 lux-card waterfront bg-white dark:bg-cardDark rounded-3xl overflow-hidden border border-black/10 dark:border-white/10 shadow-lg hover-lift">
+        <div class="relative h-72 overflow-hidden">
+          <img src="https://images.unsplash.com/photo-1613977257363-707ba9348227?auto=format&fit=crop&w=800&q=85" alt="Waterfront Haven" class="w-full h-full object-cover transition duration-700 hover:scale-105" />
+          <div class="absolute top-4 left-4 px-3 py-1 rounded-full bg-black/70 backdrop-blur-md text-white text-[10px] font-display uppercase tracking-widest">Jabi Lake Waterfront</div>
+          <div class="absolute top-4 right-4 px-3 py-1 rounded-full bg-emerald-500 text-black font-bold text-xs uppercase">Available</div>
+        </div>
+        <div class="p-6">
+          <div class="flex justify-between items-baseline mb-2">
+            <h3 class="font-serif text-2xl font-bold">Jabi Lakefront Sanctuary</h3>
+            <span class="font-serif font-bold text-xl text-bronzeGold-500">₦2.75B</span>
+          </div>
+          <p class="text-xs text-neutral-500 dark:text-neutral-400 mb-6">Direct lake frontage with private yacht jetty, hybrid solar microgrid, smart cinema & wellness spa.</p>
+          <div class="flex items-center justify-between border-t border-black/10 dark:border-white/10 pt-4 text-xs font-semibold text-neutral-600 dark:text-neutral-300">
+            <span><i class="fa-solid fa-bed me-1.5 text-bronzeGold-500"></i>7 Beds</span>
+            <span><i class="fa-solid fa-bath me-1.5 text-bronzeGold-500"></i>8 Baths</span>
+            <span><i class="fa-solid fa-vector-square me-1.5 text-bronzeGold-500"></i>2,100 sqm</span>
+          </div>
+          <button onclick="openLuxModal('Jabi Lakefront Sanctuary', '₦2.75B', 'Jabi Lake Waterfront, Abuja', '7 Beds • 8 Baths • 2,100 sqm • Private Jetty • Solar Grid', 'https://images.unsplash.com/photo-1613977257363-707ba9348227?auto=format&fit=crop&w=800&q=85')" class="mt-6 w-full py-3 rounded-2xl bg-neutral-100 dark:bg-white/10 hover:bg-black hover:text-white dark:hover:bg-white dark:hover:text-black font-bold text-xs uppercase tracking-wider transition">
+            View Floor Plan & Specs
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- AMENITIES MATRIX (6-Card Luxoria Grid) -->
+  <section id="amenities" class="py-24 bg-neutral-100 dark:bg-[#0c0f17]/60 border-y border-black/5 dark:border-white/10">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="text-center max-w-3xl mx-auto mb-20">
+        <span class="text-xs uppercase tracking-[0.25em] text-bronzeGold-500 font-display font-semibold block mb-2">Uncompromising Finish</span>
+        <h2 class="font-serif text-3xl sm:text-5xl font-bold tracking-tight mb-4">Curated Private Amenities</h2>
+        <p class="text-neutral-500 dark:text-neutral-400 text-sm sm:text-base">Every residence curated by {{ business_name }} integrates European architectural finishes, biometric fortress privacy, and dedicated concierge services.</p>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+        <div class="reveal p-8 rounded-3xl bg-white dark:bg-cardDark border border-black/5 dark:border-white/10 hover-lift">
+          <div class="w-12 h-12 rounded-2xl bg-bronzeGold-500/10 text-bronzeGold-500 flex items-center justify-center text-xl mb-6"><i class="fa-solid fa-shield-halved"></i></div>
+          <h4 class="font-display text-xl font-bold mb-2">Biometric Fortress Security</h4>
+          <p class="text-xs text-neutral-500 dark:text-neutral-400">24/7 AI perimeter radar surveillance, biometric keyless access, and armored private gates.</p>
+        </div>
+        <div class="reveal reveal-delay-1 p-8 rounded-3xl bg-white dark:bg-cardDark border border-black/5 dark:border-white/10 hover-lift">
+          <div class="w-12 h-12 rounded-2xl bg-bronzeGold-500/10 text-bronzeGold-500 flex items-center justify-center text-xl mb-6"><i class="fa-solid fa-water-ladder"></i></div>
+          <h4 class="font-display text-xl font-bold mb-2">Private Infinity Pools</h4>
+          <p class="text-xs text-neutral-500 dark:text-neutral-400">Heated temperature-controlled pools with submerged sun-loungers and automated filtration.</p>
+        </div>
+        <div class="reveal reveal-delay-2 p-8 rounded-3xl bg-white dark:bg-cardDark border border-black/5 dark:border-white/10 hover-lift">
+          <div class="w-12 h-12 rounded-2xl bg-bronzeGold-500/10 text-bronzeGold-500 flex items-center justify-center text-xl mb-6"><i class="fa-solid fa-solar-panel"></i></div>
+          <h4 class="font-display text-xl font-bold mb-2">Industrial Solar Microgrids</h4>
+          <p class="text-xs text-neutral-500 dark:text-neutral-400">High-capacity soundproof hybrid energy microgrids guaranteeing 100% uninterrupted power.</p>
+        </div>
+        <div class="reveal p-8 rounded-3xl bg-white dark:bg-cardDark border border-black/5 dark:border-white/10 hover-lift">
+          <div class="w-12 h-12 rounded-2xl bg-bronzeGold-500/10 text-bronzeGold-500 flex items-center justify-center text-xl mb-6"><i class="fa-solid fa-kitchen-set"></i></div>
+          <h4 class="font-display text-xl font-bold mb-2">Italian Marble & Miele</h4>
+          <p class="text-xs text-neutral-500 dark:text-neutral-400">Custom imported Calacatta marble surfaces, bespoke cabinetry & integrated Miele gourmet appliances.</p>
+        </div>
+        <div class="reveal reveal-delay-1 p-8 rounded-3xl bg-white dark:bg-cardDark border border-black/5 dark:border-white/10 hover-lift">
+          <div class="w-12 h-12 rounded-2xl bg-bronzeGold-500/10 text-bronzeGold-500 flex items-center justify-center text-xl mb-6"><i class="fa-solid fa-elevator"></i></div>
+          <h4 class="font-display text-xl font-bold mb-2">Schindler Private Lifts</h4>
+          <p class="text-xs text-neutral-500 dark:text-neutral-400">Private panoramic elevators servicing subterranean vehicle galleries to rooftop sky lounges.</p>
+        </div>
+        <div class="reveal reveal-delay-2 p-8 rounded-3xl bg-white dark:bg-cardDark border border-black/5 dark:border-white/10 hover-lift">
+          <div class="w-12 h-12 rounded-2xl bg-bronzeGold-500/10 text-bronzeGold-500 flex items-center justify-center text-xl mb-6"><i class="fa-solid fa-bell-concierge"></i></div>
+          <h4 class="font-display text-xl font-bold mb-2">24/7 VIP Chauffeur & Concierge</h4>
+          <p class="text-xs text-neutral-500 dark:text-neutral-400">On-demand executive fleet management, diplomatic airport transfers, and white-glove maintenance.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- PRIVATE INSPECTION & WHATSAPP FORM -->
+  <section id="inquiry" class="py-24 bg-black text-white relative">
+    <div class="max-w-4xl mx-auto px-4 relative z-10">
+      <div class="text-center max-w-xl mx-auto mb-12">
+        <span class="text-xs uppercase tracking-[0.25em] text-bronzeGold-400 font-display font-semibold block mb-2">By Confidential Appointment</span>
+        <h2 class="font-serif text-3xl sm:text-5xl font-bold tracking-tight">Schedule Private Inspection</h2>
+        <p class="text-neutral-400 text-sm mt-3">Arrange a private in-person walkthrough or live virtual tour with our Senior Partner.</p>
+      </div>
+
+      <form onsubmit="handleLuxInquiry(event)" class="reveal bg-white/5 backdrop-blur-xl border border-white/10 p-8 sm:p-10 rounded-3xl space-y-6">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+          <div>
+            <label class="block text-xs font-semibold uppercase text-neutral-400 mb-2">Full Name</label>
+            <input type="text" id="lux_name" required placeholder="Lord / Dr. / Alhaji / Mr." class="w-full px-4 py-3 rounded-2xl bg-white/10 border border-white/10 text-white text-sm focus:outline-none focus:border-bronzeGold-500" />
+          </div>
+          <div>
+            <label class="block text-xs font-semibold uppercase text-neutral-400 mb-2">WhatsApp Contact</label>
+            <input type="tel" id="lux_phone" required placeholder="+234 ..." class="w-full px-4 py-3 rounded-2xl bg-white/10 border border-white/10 text-white text-sm focus:outline-none focus:border-bronzeGold-500" />
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-6">
+          <div>
+            <label class="block text-xs font-semibold uppercase text-neutral-400 mb-2">Residence of Interest</label>
+            <select id="lux_res" class="w-full px-4 py-3 rounded-2xl bg-neutral-900 border border-white/10 text-white text-sm focus:outline-none focus:border-bronzeGold-500">
+              <option value="The Royal Imperial Villa (₦2.15B)">The Royal Imperial Villa (₦2.15B)</option>
+              <option value="Celeste Skyline Penthouse (₦1.1B)">Celeste Skyline Penthouse (₦1.1B)</option>
+              <option value="Jabi Lakefront Sanctuary (₦2.75B)">Jabi Lakefront Sanctuary (₦2.75B)</option>
+              <option value="General Luxoria Portfolio Consultation">General Luxoria Portfolio Consultation</option>
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold uppercase text-neutral-400 mb-2">Preferred Inspection Date</label>
+            <input type="date" id="lux_date" required class="w-full px-4 py-3 rounded-2xl bg-white/10 border border-white/10 text-white text-sm focus:outline-none focus:border-bronzeGold-500" />
+          </div>
+        </div>
+
+        <div>
+          <label class="block text-xs font-semibold uppercase text-neutral-400 mb-2">Special Requirements / Notes</label>
+          <textarea id="lux_notes" rows="3" placeholder="Subterranean parking, private helipad, currency preferences..." class="w-full px-4 py-3 rounded-2xl bg-white/10 border border-white/10 text-white text-sm focus:outline-none focus:border-bronzeGold-500"></textarea>
+        </div>
+
+        <button type="submit" class="w-full py-4 rounded-2xl bg-bronzeGold-500 hover:bg-bronzeGold-600 text-black font-bold text-sm tracking-wider uppercase transition shadow-xl flex items-center justify-center gap-2">
+          <i class="fa-brands fa-whatsapp text-lg"></i>
+          <span>Confirm Private Inspection on WhatsApp</span>
+        </button>
+      </form>
+    </div>
+  </section>
+
+  <!-- EXECUTIVE FOOTER -->
+  <footer class="bg-black text-white border-t border-white/10 py-16">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 grid grid-cols-1 md:grid-cols-4 gap-10">
+      <div class="md:col-span-2">
+        <div class="flex items-center gap-3 mb-4">
+          <div class="w-8 h-8 rounded-lg bg-bronzeGold-500/20 text-bronzeGold-500 flex items-center justify-center font-display font-bold text-sm"><i class="fa-solid fa-gem"></i></div>
+          <span class="font-display text-2xl font-bold">{{ business_name }}</span>
+        </div>
+        <p class="text-neutral-400 text-sm max-w-md mb-6 leading-relaxed">{{ tagline }}</p>
+        <p class="text-neutral-500 text-xs"><i class="fa-solid fa-location-dot me-2 text-bronzeGold-500"></i>{{ location }}</p>
+        <p class="text-neutral-500 text-xs mt-1"><i class="fa-solid fa-phone me-2 text-bronzeGold-500"></i>{{ phone_number }}</p>
+      </div>
+
+      <div>
+        <div class="text-xs uppercase tracking-widest text-bronzeGold-500 font-display font-bold mb-4">Prime Districts</div>
+        <ul class="space-y-2 text-sm text-neutral-400">
+          <li><a href="#properties" class="hover:text-white transition">Maitama Diplomatic Mansions</a></li>
+          <li><a href="#properties" class="hover:text-white transition">Guzape Skyline Penthouses</a></li>
+          <li><a href="#properties" class="hover:text-white transition">Asokoro Ridge Residences</a></li>
+          <li><a href="#properties" class="hover:text-white transition">Jabi Waterfront Sanctuaries</a></li>
+        </ul>
+      </div>
+
+      <div>
+        <div class="text-xs uppercase tracking-widest text-bronzeGold-500 font-display font-bold mb-4">Private Office</div>
+        <p class="text-xs text-neutral-400 mb-4">Private appointments scheduled Monday through Saturday, 9:00 AM – 6:00 PM.</p>
+        <div class="flex items-center gap-3">
+          <a href="#" class="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center hover:bg-bronzeGold-500 hover:text-black transition"><i class="fa-brands fa-instagram text-xs"></i></a>
+          <a href="#" class="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center hover:bg-bronzeGold-500 hover:text-black transition"><i class="fa-brands fa-linkedin text-xs"></i></a>
+          <a href="https://wa.me/{{ clean_phone }}" target="_blank" class="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center hover:bg-bronzeGold-500 hover:text-black transition"><i class="fa-brands fa-whatsapp text-xs"></i></a>
+        </div>
+      </div>
+    </div>
+
+    <div class="max-w-7xl mx-auto px-4 mt-12 pt-8 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between text-xs text-neutral-600 gap-4">
+      <div>© 2026 {{ business_name }}. All rights reserved.</div>
+      <div class="flex gap-6">
+        <a href="#" class="hover:text-neutral-400 transition">Confidentiality Agreement</a>
+        <a href="#" class="hover:text-neutral-400 transition">Terms of Acquisition</a>
+      </div>
+    </div>
+  </footer>
+
+  <!-- MOBILE BOTTOM STICKY ACTION BAR -->
+  <div class="md:hidden fixed bottom-0 left-0 right-0 z-50 bg-[#faf8f5]/95 dark:bg-[#090a0f]/95 backdrop-blur-md border-t border-black/10 dark:border-white/10 p-3 flex gap-2">
+    <a href="tel:{{ clean_phone }}" class="flex-1 py-3 rounded-xl bg-black/10 dark:bg-white/10 text-center font-bold text-xs uppercase flex items-center justify-center gap-1.5">
+      <i class="fa-solid fa-phone"></i>
+      <span>Call</span>
+    </a>
+    <a href="https://wa.me/{{ clean_phone }}?text=Hello%20{{ business_name }},%20I%20am%20interested%20in%20your%20Luxoria%20residences." target="_blank" class="flex-1 py-3 rounded-xl bg-emerald-600 text-white text-center font-bold text-xs uppercase flex items-center justify-center gap-1.5">
+      <i class="fa-brands fa-whatsapp"></i>
+      <span>WhatsApp</span>
+    </a>
+    <a href="#inquiry" class="flex-[1.5] py-3 rounded-xl bg-bronzeGold-500 text-black text-center font-bold text-xs uppercase flex items-center justify-center gap-1.5">
+      <i class="fa-solid fa-calendar-check"></i>
+      <span>Book Tour</span>
+    </a>
+  </div>
+
+  <!-- INTERACTIVE DETAIL MODAL -->
+  <div id="lux-modal" class="fixed inset-0 z-50 bg-black/80 backdrop-blur-md hidden flex items-center justify-center p-4">
+    <div class="bg-white dark:bg-cardDark border border-black/10 dark:border-white/10 rounded-3xl max-w-2xl w-full p-6 sm:p-8 relative max-h-[90vh] overflow-y-auto">
+      <button onclick="closeLuxModal()" class="absolute top-6 right-6 w-8 h-8 rounded-full bg-black/5 dark:bg-white/10 flex items-center justify-center hover:bg-red-500 hover:text-white transition">
+        <i class="fa-solid fa-xmark"></i>
+      </button>
+
+      <img id="lux-m-img" src="" alt="Property" class="w-full h-64 object-cover rounded-2xl mb-6" />
+      <div class="flex justify-between items-baseline mb-2">
+        <h3 id="lux-m-title" class="font-serif text-2xl sm:text-3xl font-bold"></h3>
+        <span id="lux-m-price" class="text-bronzeGold-500 font-serif font-bold text-xl sm:text-2xl"></span>
+      </div>
+      <p id="lux-m-loc" class="text-xs text-neutral-500 dark:text-neutral-400 mb-4"></p>
+      <p id="lux-m-specs" class="text-sm font-semibold text-neutral-700 dark:text-neutral-300 mb-6 bg-black/5 dark:bg-white/5 p-4 rounded-xl"></p>
+
+      <div class="flex gap-4">
+        <button onclick="bookFromLuxModal()" class="flex-1 py-3.5 rounded-xl bg-bronzeGold-500 hover:bg-bronzeGold-600 text-black font-bold text-xs uppercase tracking-wider transition">
+          Schedule Private Tour
+        </button>
+        <button onclick="closeLuxModal()" class="px-6 py-3.5 rounded-xl border border-black/10 dark:border-white/10 text-xs font-semibold uppercase">
+          Close
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // Theme Switcher
+    const htmlRoot = document.getElementById('html-root');
+    const themeBtn = document.getElementById('theme-toggle');
+
+    function setLuxTheme(isDark) {
+      if (isDark) {
+        htmlRoot.classList.add('dark');
+        localStorage.setItem('theme', 'dark');
+      } else {
+        htmlRoot.classList.remove('dark');
+        localStorage.setItem('theme', 'light');
+      }
+    }
+
+    setLuxTheme((localStorage.getItem('theme') || 'light') === 'dark');
+    themeBtn.addEventListener('click', () => setLuxTheme(!htmlRoot.classList.contains('dark')));
+
+    // Filter Tabs
+    function filterLuxTab(cat, btn) {
+      document.querySelectorAll('.lux-tab').forEach(b => {
+        b.classList.remove('active', 'bg-black', 'dark:bg-white', 'text-white', 'dark:text-black');
+        b.classList.add('bg-black/5', 'dark:bg-white/10');
+      });
+      btn.classList.add('active', 'bg-black', 'dark:bg-white', 'text-white', 'dark:text-black');
+      btn.classList.remove('bg-black/5', 'dark:bg-white/10');
+
+      document.querySelectorAll('.lux-card').forEach(c => {
+        c.style.display = (cat === 'all' || c.classList.contains(cat)) ? 'block' : 'none';
+      });
+    }
+
+    // Modal Details
+    let curLuxProp = '';
+    function openLuxModal(title, price, loc, specs, img) {
+      curLuxProp = title;
+      document.getElementById('lux-m-title').innerText = title;
+      document.getElementById('lux-m-price').innerText = price;
+      document.getElementById('lux-m-loc').innerText = loc;
+      document.getElementById('lux-m-specs').innerText = specs;
+      document.getElementById('lux-m-img').src = img;
+      document.getElementById('lux-modal').classList.remove('hidden');
+    }
+
+    function closeLuxModal() {
+      document.getElementById('lux-modal').classList.add('hidden');
+    }
+
+    function bookFromLuxModal() {
+      closeLuxModal();
+      document.getElementById('lux_res').value = curLuxProp;
+      document.getElementById('inquiry').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    // Search Bar
+    function handleLuxoriaSearch(e) {
+      e.preventDefault();
+      const type = document.getElementById('lux_type').value;
+      document.querySelectorAll('.lux-card').forEach(c => {
+        c.style.display = (type === 'all' || c.classList.contains(type)) ? 'block' : 'none';
+      });
+      document.getElementById('properties').scrollIntoView({ behavior: 'smooth' });
+    }
+
+    // Scroll Reveal IntersectionObserver
+    const revealEls = document.querySelectorAll('.reveal');
+    const revealObs = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('active');
+        }
+      });
+    }, { threshold: 0.12 });
+    revealEls.forEach(el => revealObs.observe(el));
+
+    // Animated Number Counters
+    const counterEls = document.querySelectorAll('[data-counter-target]');
+    const counterObs = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting && !entry.target.dataset.counted) {
+          entry.target.dataset.counted = 'true';
+          const target = parseFloat(entry.target.dataset.counterTarget);
+          const prefix = entry.target.dataset.counterPrefix || '';
+          const suffix = entry.target.dataset.counterSuffix || '';
+          const isDecimal = target % 1 !== 0;
+          let start = 0;
+          const duration = 1400;
+          const startTime = performance.now();
+          function updateCounter(currentTime) {
+            const elapsed = currentTime - startTime;
+            const progress = Math.min(elapsed / duration, 1);
+            const easeOut = 1 - Math.pow(1 - progress, 3);
+            const currentVal = (start + (target - start) * easeOut);
+            entry.target.innerText = prefix + (isDecimal ? currentVal.toFixed(1) : Math.floor(currentVal).toLocaleString()) + suffix;
+            if (progress < 1) requestAnimationFrame(updateCounter);
+          }
+          requestAnimationFrame(updateCounter);
+        }
+      });
+    }, { threshold: 0.2 });
+    counterEls.forEach(el => counterObs.observe(el));
+
+    // Inquiry WhatsApp dispatch
+    function handleLuxInquiry(e) {
+      e.preventDefault();
+      const name = document.getElementById('lux_name').value;
+      const phone = document.getElementById('lux_phone').value;
+      const res = document.getElementById('lux_res').value;
+      const date = document.getElementById('lux_date').value;
+      const notes = document.getElementById('lux_notes').value;
+
+      const msg = `Hello {{ business_name }}, I would like to schedule a private inspection:\n\n*Name:* ${name}\n*Phone:* ${phone}\n*Residence:* ${res}\n*Date:* ${date}\n*Notes:* ${notes}`;
+      window.open(`https://wa.me/{{ clean_phone }}?text=${encodeURIComponent(msg)}`, '_blank');
+    }
+  </script>
+</body>
+</html>

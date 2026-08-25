@@ -1,0 +1,362 @@
+"""Auto-inject retrieval hook (spec §6, §7).
+
+A ``before_llm_call`` hook that — when the current turn needs historical
+context — retrieves relevant memory and injects a single, self-replacing
+evidence block into the agent's message history right before the LLM call.
+Runs AFTER the compaction hook (merged on top) so fresh evidence is never
+summarized away in the same turn.
+
+Cost model: most turns are Level 0 (no retrieval). The cheap signals
+(identifier regex + English lexicon) fire with zero model cost; only when
+those are silent does the multilingual embedding gate run (one short-query
+embedding). Gated entirely by ``memory.enabled``; best-effort — never breaks
+the LLM call.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+
+from helpers.agent_identity import normalize_agent_name
+
+logger = logging.getLogger("memory.retrieval_hook")
+
+# Fast-lane capture is a FREQUENCY gate, not a content classifier: run the cheap
+# extractor every N user turns over the recent snippet. A frequency gate cannot
+# misclassify content (the brittleness we removed); the LLM is the precise
+# decider, debounce just bounds cost.
+EXTRACT_EVERY_N = 4
+
+# RESERVED sentinel prefixing our injected block. Two jobs: (1) code detects an
+# auto-injected memory message by this stable token — NOT by the human-readable
+# prose, which is free to reword/i18n; (2) provenance so business logic can
+# filter these out of "real user" messages. Never change this literal. The
+# ``jarvis:provenance`` channel carries the same flag for surfaces that don't
+# read content (persists through save/load history).
+MEMORY_MARKER = "⟦memory:recalled⟧"
+PROVENANCE_CHANNEL = "jarvis:provenance"
+PROVENANCE_RECALL = "memory_recall"
+# The record_ids carried by each injected block live in this channel, so the
+# "already recalled?" gate is derived from HISTORY (not a process-lifetime
+# in-memory attribute) → it survives a restart / agent re-creation. Dedup is
+# PER-RECORD_ID (not per whole-set): a turn only injects memories whose id is
+# not already somewhere in the conversation, so a slightly different relevant
+# set no longer re-injects the overlap. record_id is the cheapest, O(1)-compare,
+# restart-stable identity; near-duplicate *content* is the capture side's job.
+RECALL_IDS_CHANNEL = "jarvis:recall_ids"
+# Per-evidence retrieval-lane provenance (fts/dense/graph), one comma-joined
+# entry per evidence, SAME ORDER as RECALL_IDS_CHANNEL and the rendered lines.
+# Computed once at recall time and persisted with the block (channels survive
+# save/load), so the debug UI can show which lane surfaced each memory WITHOUT
+# costing a single prompt token (channels never reach the LLM as content). This
+# is the durable replacement for a live-only SSE: it's correct on reload too.
+RECALL_LANES_CHANNEL = "jarvis:recall_lanes"
+# Per-evidence relevance + confidence for the debug chip, one ``rel|conf|authority``
+# entry per evidence (SAME order as the lines). RAW values, not percentages —
+# deliberately: a normalized % makes the top hit always "100%" (looks like a
+# perfect match when it's just the batch max) and invites confusing relevance
+# with confidence. ``rel`` is the raw RRF fusion score (higher = better match,
+# typically ~0.01–0.05); ``conf`` is the memory's intrinsic confidence that the
+# FACT is true (0–1); ``authority`` lets the UI mark verified memories. The unit
+# is opaque on purpose — a reader who cares learns it. Persisted like the lanes.
+RECALL_SCORES_CHANNEL = "jarvis:recall_scores"
+# Authorities the UI marks as "verified" (hard-confirmed, not soft-observed).
+VERIFIED_AUTHORITIES = {"user_confirmed", "tool_verified"}
+# Recall is ALWAYS-ON now (no intent gate): retrieve across these types every
+# turn and let relevance ranking decide what (if anything) is worth injecting.
+RECALL_TYPES = ["episodic", "semantic", "procedural"]
+
+
+def _msg_text(msg) -> str:
+    parts = []
+    for block in getattr(msg, "content", None) or []:
+        t = getattr(block, "text", None)
+        if t:
+            parts.append(t)
+    return "\n".join(parts)
+
+
+def is_injected_memory(msg) -> bool:
+    """True if ``msg`` is an auto-injected memory-recall block (not real user
+    input). Detects via the provenance channel first, then the reserved sentinel
+    — never the human-readable prose. Use this anywhere business logic must
+    exclude injected memory (turn counting, export, analytics)."""
+    channels = getattr(msg, "channels", None) or {}
+    if PROVENANCE_CHANNEL in channels:
+        return True
+    return MEMORY_MARKER in _msg_text(msg)
+
+
+def _latest_user_text(delta_messages) -> str:
+    for msg in reversed(list(delta_messages or [])):
+        if str(getattr(msg, "role", "")) == "user" and not is_injected_memory(msg):
+            txt = _msg_text(msg).strip()
+            if txt:
+                return txt
+    return ""
+
+
+def _created_dates(evidence) -> dict:
+    """``record_id → 'YYYY-MM-DD'`` created date for the recalled memories. The
+    agent reads these to recency-tiebreak two conflicting memories itself — the
+    READ-side safety net behind ``conflict.resolve_conflicts`` (if the write-time
+    resolver missed, "the newer date wins"). One bounded query; any failure → no
+    stamps (the block still renders, just without dates)."""
+    ids = [e.record_id for e in evidence if getattr(e, "record_id", None)]
+    if not ids:
+        return {}
+    try:
+        from datetime import datetime, timezone
+
+        from core.database import MemoryRecord, get_db_session
+        db = get_db_session()
+        try:
+            rows = (db.query(MemoryRecord.id, MemoryRecord.created_at)
+                    .filter(MemoryRecord.id.in_(ids)).all())
+        finally:
+            db.close()
+        return {rid: datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                for rid, ts in rows if ts}
+    except Exception as exc:  # noqa: BLE001 — date stamp is best-effort
+        logger.warning("[MEMORY] recall date lookup failed: %s", exc)
+        return {}
+
+
+def _render_block(evidence) -> str:
+    lines = [f"{MEMORY_MARKER} [System memory recall — not user input] Stored "
+             f"memories that may be relevant to the user's message (reference "
+             f"only; do not repeat verbatim). If two memories conflict, the one "
+             f"with the newer saved date wins:"]
+    dates = _created_dates(evidence)
+    for e in evidence:
+        d = dates.get(getattr(e, "record_id", None))
+        stamp = f" (saved {d})" if d else ""
+        lines.append(f"- [{e.memory_type}]{stamp} {e.excerpt}")
+    return "\n".join(lines)
+
+
+def _score_dict(e) -> dict:
+    """RAW per-line debug score for one evidence: the REAL RRF fusion score AND
+    the cross-encoder reranker score, kept SEPARATE (they answer different
+    questions — rrf = lane-fusion rank, rerank = joint (query,memory) relevance,
+    which is the authoritative post-rerank order and can be ~1.0 when the query
+    nearly restates the memory). Plus fact-truth confidence + authority. No
+    normalization (see RECALL_SCORES_CHANNEL). Either score is ``None`` when its
+    stage didn't run. SINGLE SOURCE OF TRUTH for both the persisted channel string
+    (``_block_scores``) and the live SSE chip (``_emit_recall_block``), so the
+    real-time chip and the reloaded one never diverge. Tolerant of partial stubs."""
+    scores = getattr(e, "scores", None)
+    rrf = getattr(scores, "rrf", None)
+    rerank = getattr(scores, "reranker", None)
+    conf = max(0.0, min(1.0, getattr(e, "confidence", 0.0) or 0.0))
+    return {"rrf": round(rrf, 4) if rrf is not None else None,
+            "rerank": round(rerank, 4) if rerank is not None else None,
+            "conf": round(conf, 2), "authority": getattr(e, "authority", "") or ""}
+
+
+def _block_scores(evidence) -> list[str]:
+    """One ``rrf|rerank|conf|authority`` string per evidence for the persisted
+    channel — derived from ``_score_dict`` so it stays identical to the live SSE
+    payload. An empty field means that score was absent (e.g. no reranker)."""
+    def _f(v):
+        return "" if v is None else v
+    return [f"{_f(s['rrf'])}|{_f(s['rerank'])}|{s['conf']}|{s['authority']}"
+            for s in map(_score_dict, evidence)]
+
+
+def _block_recall_ids(msg) -> list[str]:
+    """The record_ids a recall block carries — one per channel entry (no join/
+    split, so it's robust to any id format)."""
+    out: list[str] = []
+    for c in (getattr(msg, "channels", None) or {}).get(RECALL_IDS_CHANNEL) or []:
+        t = getattr(c, "text", None)
+        if t:
+            out.append(t)
+    return out
+
+
+def _recalled_ids(history) -> set[str]:
+    """record_ids of every memory already injected somewhere in this
+    conversation. A new turn skips any of these (already in context) and injects
+    only the genuinely-new ones — no duplication, and we never touch the older
+    blocks so the KV prefix cache stays warm."""
+    ids: set[str] = set()
+    for m in history:
+        if is_injected_memory(m):
+            ids.update(_block_recall_ids(m))
+    return ids
+
+
+def _build_block_message(evidence):
+    """A memory-recall message: prose in ``content`` (the LLM reads it); the
+    provenance flag + this block's record_ids in ``channels`` (code reads them,
+    persist through save/load, don't reach the LLM as content). Role stays
+    ``user`` framed — the standard cross-provider RAG pattern — never a plain
+    unmarked user message."""
+    from fast_agent.mcp.helpers.content_helpers import text_content
+    from fast_agent.mcp.prompt_message_extended import PromptMessageExtended
+    from services.retrieval.contracts import lanes_of
+    return PromptMessageExtended(
+        role="user",
+        content=[text_content(_render_block(evidence))],
+        channels={PROVENANCE_CHANNEL: [text_content(PROVENANCE_RECALL)],
+                  RECALL_IDS_CHANNEL: [text_content(e.record_id) for e in evidence],
+                  RECALL_LANES_CHANNEL: [text_content(",".join(lanes_of(getattr(e, "scores", None)))) for e in evidence],
+                  RECALL_SCORES_CHANNEL: [text_content(s) for s in _block_scores(evidence)]},
+    )
+
+
+def _emit_recall_block(owner: str, fresh) -> None:
+    """Live SSE mirror of the recall block just injected, so the chat UI shows the
+    "memories used" chip in REAL TIME instead of only after a page reload (the
+    chip was previously built solely from persisted history fetched on mount).
+
+    Carries exactly what the block persists — the rendered prose + per-line lanes
+    + per-line scores, all from ``fresh`` (the deduped set actually injected) — so
+    the live chip is byte-identical to the one rebuilt from history on reload.
+    Best-effort: a broadcast failure must never break the LLM call."""
+    try:
+        from services.activity_stream import activity_stream_manager
+        from services.retrieval.contracts import lanes_of
+        from services.sse_progress import current_conversation_id
+        activity_stream_manager.broadcast({
+            "agent_name": owner,
+            "event_type": "memory_recalled",
+            "data": {
+                # Route to the originating conversation: the stream fans out
+                # per-agent, and one agent owns many conversations, so the UI
+                # must drop a recall block that isn't this conversation's.
+                "conversation_id": current_conversation_id.get() or None,
+                "content": _render_block(fresh),
+                "recall_lanes": [lanes_of(getattr(e, "scores", None)) for e in fresh],
+                "recall_scores": [_score_dict(e) for e in fresh],
+            },
+        })
+    except Exception as exc:  # noqa: BLE001 — never break the LLM call
+        logger.debug("[MEMORY] recall SSE emit failed: %s", exc)
+
+
+def create_memory_retrieval_hooks():
+    from fast_agent.agents.tool_runner import ToolRunnerHooks
+
+    async def on_before_llm_call(runner, delta_messages) -> None:
+        try:
+            from services.memory.settings import get_memory_settings
+            cfg = get_memory_settings()
+            if not cfg.enabled:
+                return
+            agent = runner._agent
+            owner = normalize_agent_name(getattr(agent, "name", "") or "")
+            # The delta is usually the user's text turn, but after a tool call it
+            # can be a tool-result with no text → fall back to the last real user
+            # message in history so recall still fires on post-tool turns.
+            query = _latest_user_text(delta_messages) or \
+                _latest_user_text(getattr(agent, "message_history", []) or [])
+            if not owner or not query:
+                return
+
+            # Capture (write side) — fast-lane LLM extractor, debounced every N
+            # turns, fire-and-forget so it never adds latency to this LLM call.
+            if cfg.auto_capture_preferences:
+                cnt = getattr(agent, "_jarvis_extract_turns", 0) + 1
+                every_n = int(getattr(cfg, "extract_every_n", EXTRACT_EVERY_N) or EXTRACT_EVERY_N)
+                if cnt >= every_n:
+                    agent._jarvis_extract_turns = 0
+                    asyncio.create_task(_run_extraction(owner, _recent_snippet(agent, query), cfg))
+                    # NOTE: KG triples are now extracted per-memory at persist time
+                    # (candidate_service → schedule_extract_and_store), NOT by a
+                    # debounced owner-wide rescan here. The startup migration
+                    # (server.py backfill_relations) repairs anything still missing.
+                else:
+                    agent._jarvis_extract_turns = cnt
+
+            # Recall — ALWAYS retrieve (no intent gate); inject only the memories
+            # NOT already somewhere in this conversation (per-record_id gate,
+            # derived from history → survives restart). We never strip/move/replace
+            # earlier blocks: mid-history mutation is what breaks the KV prefix
+            # cache. So a memory recalled on an earlier turn is skipped here (no
+            # re-injection, no wasted tokens) and only genuinely-new memories get a
+            # fresh block appended at the tail. If every relevant memory is already
+            # in context, nothing is appended and the prefix stays warm.
+            evidence = await _retrieve(owner, query, RECALL_TYPES, cfg)
+            if not evidence:
+                return
+            history = getattr(agent, "message_history", []) or []
+            # Dedup against BOTH committed history AND this turn's delta: a block
+            # appended on an earlier tool-step of the same turn isn't merged into
+            # message_history until the turn commits, so check the live delta too.
+            already = _recalled_ids(history) | _recalled_ids(delta_messages)
+            fresh = [e for e in evidence if e.record_id not in already]
+            if not fresh:
+                return                      # all relevant memory already in context
+            # Append to the DELTA (after the user's current message) so the recall
+            # lands AFTER the user turn, not before it — the delta is the exact
+            # list handed to the LLM step, and is merged into message_history when
+            # the turn commits, so the block persists & dedups exactly as before,
+            # just correctly ordered. Never mutate earlier history → KV cache safe.
+            delta_messages.append(_build_block_message(fresh))
+            # Mirror the block to the chat UI live (chip shows now, not on reload).
+            _emit_recall_block(owner, fresh)
+        except Exception as exc:  # noqa: BLE001 — never break the LLM call
+            logger.error("[MEMORY] retrieval hook error: %s", exc, exc_info=True)
+
+    return ToolRunnerHooks(before_llm_call=on_before_llm_call)
+
+
+def _recent_snippet(agent, current_query: str, n_msgs: int = 8) -> str:
+    """Recent conversation text fed to the fast-lane extractor: the last few real
+    messages (injected memory blocks excluded) plus the current user turn."""
+    lines = []
+    for m in (getattr(agent, "message_history", []) or [])[-n_msgs:]:
+        if is_injected_memory(m):
+            continue
+        txt = _msg_text(m).strip()
+        if txt:
+            lines.append(f"{getattr(m, 'role', 'user')}: {txt}")
+    lines.append(f"user: {current_query}")
+    return "\n".join(lines)
+
+
+async def _run_extraction(owner: str, snippet: str, cfg) -> None:
+    """Fire-and-forget fast-lane extraction (best-effort; never raises)."""
+    try:
+        from services.memory.fast_extractor import run_fast_extraction
+        await run_fast_extraction(owner, snippet, cfg)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[MEMORY] fast extraction failed: %s", exc)
+
+
+async def _retrieve(owner: str, query: str, targets: set[str], cfg):
+    from core.database import get_db_session
+    from services.retrieval.contracts import RetrievalRequest
+    from services.retrieval.orchestrator import RetrievalOrchestrator
+    db = get_db_session()
+    try:
+        orch = RetrievalOrchestrator(db, cfg)
+        req = RetrievalRequest(owner_agent_name=owner, query=query,
+                               types=list(targets), mode=cfg.mode)
+        # The hook already decided this turn needs recall → force the fast round.
+        result = await orch.retrieve(req, now=time.time(), agent_requested=True)
+        return result.evidence
+    finally:
+        db.close()
+
+
+def attach_memory_hooks_to_all(agent_app) -> int:
+    """Idempotently attach the retrieval hook to every in-process agent, merged
+    ON TOP of the compaction hook (so compaction runs first). Mirror of
+    attach_compaction_hooks_to_all."""
+    from services.sse_progress import merge_hooks
+
+    hook = create_memory_retrieval_hooks()
+    newly = 0
+    agents = getattr(agent_app, "_agents", {}) or {}
+    for name, ag in agents.items():
+        if getattr(ag, "_jarvis_memory_hook", False):
+            continue
+        existing = getattr(ag, "tool_runner_hooks", None)
+        ag.tool_runner_hooks = merge_hooks(existing, hook) if existing else hook
+        ag._jarvis_memory_hook = True
+        newly += 1
+    return newly

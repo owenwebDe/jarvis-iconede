@@ -1,0 +1,65 @@
+name: iconedge-growth-team
+description: "IconEdge Growth Team: Lead Research → Creative Strategy → Ads Drafting (PAUSED Safety) → Cold Outreach Pipeline."
+
+roles:
+  lead_researcher:
+    instruction: |
+      You are the Lead Research Agent for IconEdge Technologies.
+      Your job:
+      1. Discover and profile high-intent global prospects and SMBs across any region (US, UK, Europe, Africa, Asia).
+      2. Identify company decision makers, industry vertical, business size, website, and specific pain points.
+      3. Save every discovered lead directly into shared memory using `prospect_save` with lead score and detailed notes.
+    servers: [memory_server, shared-memory, web-search, multi-source-search, lead-sources, scrapling-server]
+    model: ""
+
+  creative_director:
+    instruction: |
+      You are the Creative Agent for IconEdge Technologies.
+      Your job:
+      1. Review researched prospect profiles from shared memory (`prospect_search`).
+      2. Generate high-converting ad copy and outreach hooks across 4 core angles: pain_point, story, direct_offer, and scarcity.
+      3. Create headline variations, body copy, call-to-actions, and photorealistic AI image generation prompts.
+      4. Save all assets directly into shared memory using `ad_creative_save`.
+    servers: [memory_server, shared-memory]
+    model: ""
+
+  ads_specialist:
+    instruction: |
+      You are the Ads Agent for IconEdge Technologies.
+      Your job:
+      1. Read ad creative assets and target audience specs from shared memory (`ad_creative_list`).
+      2. Construct Meta Ads campaign structures with audience interest targeting and budget constraints.
+      3. CRITICAL SAFETY RULE: Always create campaigns in 'PAUSED' status using `meta_ads_create_campaign` or `campaign_save`. Never activate live spend without explicit confirmation code 'CONFIRMED_BY_OWEN'.
+      4. Save campaign specifications into shared memory.
+    servers: [memory_server, shared-memory, meta-marketing]
+    model: ""
+
+  outreach_specialist:
+    instruction: |
+      You are the Outreach Agent for IconEdge Technologies.
+      Your job:
+      1. Query qualified prospects from shared memory (`prospect_search`).
+      2. Draft personalized multi-channel outreach messages tailored to each prospect's pain point (WhatsApp Business message and Email cold pitch).
+      3. Record outreach touchpoints and update prospect status to 'contacted' in shared memory using `prospect_save`.
+    servers: [memory_server, shared-memory, gmail, time-service]
+    model: ""
+
+workflow:
+  - step: lead_discovery
+    agent: lead_researcher
+    task: "Profile and research target prospects for: {project_brief}. Save all leads to shared memory."
+
+  - step: creative_generation
+    agent: creative_director
+    depends_on: [lead_discovery]
+    task: "Review leads in shared memory and generate tailored ad hooks, headlines, and image prompts. Save to shared memory."
+
+  - step: campaign_drafting
+    agent: ads_specialist
+    depends_on: [creative_generation]
+    task: "Draft Meta Ads campaign and audience targeting using the generated creatives. Enforce PAUSED status. Save to shared memory."
+
+  - step: outreach_preparation
+    agent: outreach_specialist
+    depends_on: [creative_generation]
+    task: "Draft personalized WhatsApp and Email outreach copy for each researched prospect and log to shared memory."

@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pristine Dry Cleaners – Abuja's Premium Laundry & Garment Care</title>
+    <meta name="description" content="Professional dry cleaning, laundry & garment care in Wuse 2, Maitama, Garki, Utako & Gwarinpa. Free pickup & delivery. Book now.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Playfair+Display:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --primary: #1a5276;
+            --primary-light: #2980b9;
+            --accent: #d4af37;
+            --accent-hover: #c5a028;
+            --dark: #0a0f1a;
+            --dark-2: #111827;
+            --text: #1f2937;
+            --text-light: #6b7280;
+            --bg: #fafbfc;
+            --bg-2: #f0f4f8;
+            --white: #ffffff;
+            --border: #e5e7eb;
+            --success: #10b981;
+            --radius: 12px;
+        }
+        html { scroll-behavior: smooth; }
+        body { font-family: 'Inter', sans-serif; color: var(--text); background: var(--bg); line-height: 1.6; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 0 24px; }
+        
+        /* ── NAV ── */
+        nav {
+            position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+            background: rgba(255,255,255,0.92); backdrop-filter: blur(20px);
+            border-bottom: 1px solid var(--border); transition: all 0.3s;
+        }
+        nav.scrolled { box-shadow: 0 2px 20px rgba(0,0,0,0.08); }
+        .nav-inner {
+            max-width: 1200px; margin: 0 auto; padding: 0 24px;
+            display: flex; align-items: center; justify-content: space-between; height: 72px;
+        }
+        .logo { display: flex; align-items: center; gap: 10px; text-decoration: none; }
+        .logo-icon {
+            width: 42px; height: 42px; border-radius: 10px;
+            background: linear-gradient(135deg, var(--primary), var(--primary-light));
+            display: flex; align-items: center; justify-content: center;
+            color: white; font-size: 18px;
+        }
+        .logo-text { font-family: 'Playfair Display', serif; font-size: 22px; font-weight: 700; color: var(--dark); }
+        .logo-text span { color: var(--accent); }
+        .nav-links { display: flex; gap: 32px; list-style: none; }
+        .nav-links a {
+            text-decoration: none; color: var(--text-light); font-size: 14px;
+            font-weight: 500; transition: color 0.2s; position: relative;
+        }
+        .nav-links a:hover { color: var(--primary); }
+        .nav-links a::after {
+            content: ''; position: absolute; bottom: -4px; left: 0; width: 0;
+            height: 2px; background: var(--accent); transition: width 0.3s;
+        }
+        .nav-links a:hover::after { width: 100%; }
+        .nav-cta {
+            display: flex; align-items: center; gap: 8px;
+            padding: 10px 20px; border-radius: 50px;
+            background: var(--success); color: white; text-decoration: none;
+            font-size: 13px; font-weight: 600; transition: all 0.3s;
+        }
+        .nav-cta:hover { background: #059669; transform: translateY(-1px); box-shadow: 0 4px 15px rgba(16,185,129,0.4); }
+        .hamburger { display: none; background: none; border: none; font-size: 24px; cursor: pointer; color: var(--dark); }
+
+        /* ── HERO ── */
+        .hero {
+            min-height: 100vh; display: flex; align-items: center;
+            background: linear-gradient(135deg, var(--dark) 0%, #1a2744 50%, var(--primary) 100%);
+            position: relative; overflow: hidden; padding-top: 72px;
+        }
+        .hero::before {
+            content: ''; position: absolute; inset: 0;
+            background: url('https://images.unsplash.com/photo-1545173168-9f1947eebb7f?auto=format&fit=crop&w=1920&q=80') center/cover;
+            opacity: 0.15;
+        }
+        .hero-content { position: relative; z-index: 2; display: grid; grid-template-columns: 1fr 1fr; gap: 60px; align-items: center; padding: 80px 0; }
+        .hero-badge {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 8px 16px; border-radius: 50px;
+            background: rgba(212,175,55,0.15); border: 1px solid rgba(212,175,55,0.3);
+            color: var(--accent); font-size: 12px; font-weight: 600;
+            letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 24px;
+        }
+        .hero h1 {
+            font-family: 'Playfair Display', serif; font-size: 56px;
+            font-weight: 700; color: white; line-height: 1.15; margin-bottom: 20px;
+        }
+        .hero h1 span { color: var(--accent); font-style: italic; }
+        .hero p { color: rgba(255,255,255,0.7); font-size: 18px; line-height: 1.7; margin-bottom: 36px; max-width: 520px; }
+        .hero-btns { display: flex; gap: 16px; flex-wrap: wrap; }
+        .btn {
+            display: inline-flex; align-items: center; gap: 8px;
+            padding: 14px 28px; border-radius: 50px; font-size: 14px;
+            font-weight: 600; text-decoration: none; transition: all 0.3s; cursor: pointer; border: none;
+        }
+        .btn-primary { background: var(--accent); color: var(--dark); }
+        .btn-primary:hover { background: var(--accent-hover); transform: translateY(-2px); box-shadow: 0 8px 25px rgba(212,175,55,0.35); }
+        .btn-outline { background: transparent; color: white; border: 2px solid rgba(255,255,255,0.3); }
+        .btn-outline:hover { border-color: white; background: rgba(255,255,255,0.1); }
+        .hero-stats { display: flex; gap: 40px; margin-top: 48px; }
+        .stat { text-align: left; }
+        .stat-num { font-size: 28px; font-weight: 800; color: var(--accent); }
+        .stat-label { font-size: 12px; color: rgba(255,255,255,0.5); text-transform: uppercase; letter-spacing: 0.1em; margin-top: 2px; }
+        .hero-card {
+            background: rgba(255,255,255,0.06); backdrop-filter: blur(20px);
+            border: 1px solid rgba(255,255,255,0.1); border-radius: 20px;
+            padding: 40px; position: relative;
+        }
+        .hero-card h3 { color: white; font-size: 20px; margin-bottom: 24px; font-weight: 600; }
+        .hero-card .form-group { margin-bottom: 16px; }
+        .hero-card label { display: block; color: rgba(255,255,255,0.6); font-size: 12px; font-weight: 500; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+        .hero-card input, .hero-card select {
+            width: 100%; padding: 12px 16px; border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.08);
+            color: white; font-size: 14px; font-family: inherit; outline: none; transition: border 0.3s;
+        }
+        .hero-card input::placeholder { color: rgba(255,255,255,0.35); }
+        .hero-card input:focus, .hero-card select:focus { border-color: var(--accent); }
+        .hero-card select option { background: var(--dark); color: white; }
+        .hero-card .btn { width: 100%; justify-content: center; }
+
+        /* ── TRUST BAR ── */
+        .trust {
+            background: var(--white); border-bottom: 1px solid var(--border);
+            padding: 24px 0;
+        }
+        .trust-inner {
+            display: flex; align-items: center; justify-content: center;
+            gap: 48px; flex-wrap: wrap;
+        }
+        .trust-item { display: flex; align-items: center; gap: 10px; color: var(--text-light); font-size: 13px; font-weight: 500; }
+        .trust-item i { color: var(--success); font-size: 16px; }
+
+        /* ── SERVICES ── */
+        .services { padding: 100px 0; }
+        .section-header { text-align: center; margin-bottom: 60px; }
+        .section-tag {
+            display: inline-flex; align-items: center; gap: 8px;
+            font-size: 12px; font-weight: 600; color: var(--primary-light);
+            text-transform: uppercase; letter-spacing: 0.15em; margin-bottom: 16px;
+        }
+        .section-header h2 {
+            font-family: 'Playfair Display', serif; font-size: 40px;
+            font-weight: 700; color: var(--dark); margin-bottom: 16px;
+        }
+        .section-header p { color: var(--text-light); font-size: 16px; max-width: 600px; margin: 0 auto; }
+        .services-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; }
+        .service-card {
+            background: var(--white); border: 1px solid var(--border);
+            border-radius: var(--radius); padding: 32px 24px; text-align: center;
+            transition: all 0.3s; position: relative; overflow: hidden;
+        }
+        .service-card:hover { transform: translateY(-6px); box-shadow: 0 20px 40px rgba(0,0,0,0.08); border-color: var(--accent); }
+        .service-card::before {
+            content: ''; position: absolute; top: 0; left: 0; right: 0;
+            height: 3px; background: linear-gradient(90deg, var(--primary), var(--accent));
+            transform: scaleX(0); transition: transform 0.3s;
+        }
+        .service-card:hover::before { transform: scaleX(1); }
+        .service-icon {
+            width: 64px; height: 64px; border-radius: 16px;
+            background: linear-gradient(135deg, var(--primary), var(--primary-light));
+            display: flex; align-items: center; justify-content: center;
+            margin: 0 auto 20px; font-size: 24px; color: white;
+        }
+        .service-card h3 { font-size: 18px; font-weight: 700; margin-bottom: 10px; color: var(--dark); }
+        .service-card p { font-size: 14px; color: var(--text-light); line-height: 1.6; }
+        .service-card .price-tag {
+            display: inline-block; margin-top: 16px; padding: 6px 14px;
+            border-radius: 50px; background: var(--bg-2); font-size: 13px;
+            font-weight: 600; color: var(--primary);
+        }
+
+        /* ── HOW IT WORKS ── */
+        .how { padding: 80px 0; background: var(--bg-2); }
+        .steps { display: grid; grid-template-columns: repeat(4, 1fr); gap: 32px; margin-top: 48px; }
+        .step { text-align: center; position: relative; }
+        .step-num {
+            width: 48px; height: 48px; border-radius: 50%;
+            background: var(--primary); color: white; font-size: 18px;
+            font-weight: 700; display: flex; align-items: center; justify-content: center;
+            margin: 0 auto 16px;
+        }
+        .step h4 { font-size: 16px; font-weight: 700; margin-bottom: 8px; color: var(--dark); }
+        .step p { font-size: 13px; color: var(--text-light); }
+        .step::after {
+            content: '→'; position: absolute; top: 24px; right: -20px;
+            font-size: 20px; color: var(--accent); font-weight: 700;
+        }
+        .step:last-child::after { display: none; }
+
+        /* ── PRICING ── */
+        .pricing { padding: 100px 0; }
+        .pricing-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+        .price-card {
+            background: var(--white); border: 2px solid var(--border);
+            border-radius: 16px; padding: 36px 28px; text-align: center;
+            transition: all 0.3s; position: relative;
+        }
+        .price-card.popular {
+            border-color: var(--accent); transform: scale(1.05);
+            box-shadow: 0 20px 50px rgba(212,175,55,0.15);
+        }
+        .price-card.popular::before {
+            content: 'MOST POPULAR'; position: absolute; top: -14px;
+            left: 50%; transform: translateX(-50%);
+            background: var(--accent); color: var(--dark); font-size: 11px;
+            font-weight: 700; letter-spacing: 0.1em; padding: 5px 16px;
+            border-radius: 50px;
+        }
+        .price-card h3 { font-size: 20px; font-weight: 700; color: var(--dark); margin-bottom: 8px; }
+        .price-card .price {
+            font-size: 40px; font-weight: 800; color: var(--primary); margin: 16px 0;
+        }
+        .price-card .price span { font-size: 16px; color: var(--text-light); font-weight: 400; }
+        .price-card ul { list-style: none; text-align: left; margin: 24px 0; }
+        .price-card li { padding: 8px 0; font-size: 14px; color: var(--text-light); display: flex; align-items: center; gap: 10px; }
+        .price-card li::before { content: '✓'; color: var(--success); font-weight: 700; }
+
+        /* ── TESTIMONIALS ── */
+        .testimonials { padding: 100px 0; background: var(--dark); color: white; }
+        .testimonials .section-header h2 { color: white; }
+        .testimonials .section-header p { color: rgba(255,255,255,0.6); }
+        .testimonial-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; }
+        .testimonial-card {
+            background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 16px; padding: 32px;
+        }
+        .testimonial-card .stars { color: var(--accent); font-size: 14px; margin-bottom: 16px; }
+        .testimonial-card p { color: rgba(255,255,255,0.7); font-size: 14px; line-height: 1.7; margin-bottom: 20px; font-style: italic; }
+        .testimonial-author { display: flex; align-items: center; gap: 12px; }
+        .testimonial-avatar {
+            width: 44px; height: 44px; border-radius: 50%;
+            background: linear-gradient(135deg, var(--primary), var(--accent));
+            display: flex; align-items: center; justify-content: center;
+            font-weight: 700; font-size: 16px;
+        }
+        .testimonial-name { font-weight: 600; font-size: 14px; }
+        .testimonial-role { font-size: 12px; color: rgba(255,255,255,0.5); }
+
+        /* ── CTA SECTION ── */
+        .cta-section {
+            padding: 80px 0;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-light) 100%);
+            text-align: center; color: white;
+        }
+        .cta-section h2 { font-family: 'Playfair Display', serif; font-size: 36px; margin-bottom: 16px; }
+        .cta-section p { color: rgba(255,255,255,0.8); font-size: 16px; margin-bottom: 32px; }
+        .cta-btns { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+        .cta-btns .btn-whatsapp { background: var(--success); color: white; }
+        .cta-btns .btn-whatsapp:hover { background: #059669; }
+
+        /* ── FOOTER ── */
+        footer { background: var(--dark); color: rgba(255,255,255,0.6); padding: 60px 0 30px; }
+        .footer-grid { display: grid; grid-template-columns: 2fr 1fr 1fr 1fr; gap: 48px; margin-bottom: 40px; }
+        .footer-brand .logo-text { color: white; font-size: 24px; margin-bottom: 12px; display: block; }
+        .footer-brand p { font-size: 14px; line-height: 1.7; }
+        .footer-col h4 { color: white; font-size: 14px; font-weight: 600; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 0.1em; }
+        .footer-col a { display: block; color: rgba(255,255,255,0.5); text-decoration: none; font-size: 14px; padding: 4px 0; transition: color 0.2s; }
+        .footer-col a:hover { color: var(--accent); }
+        .footer-bottom { border-top: 1px solid rgba(255,255,255,0.1); padding-top: 24px; display: flex; justify-content: space-between; align-items: center; font-size: 13px; }
+        .social-links { display: flex; gap: 12px; }
+        .social-links a {
+            width: 36px; height: 36px; border-radius: 50%;
+            border: 1px solid rgba(255,255,255,0.2); display: flex;
+            align-items: center; justify-content: center;
+            color: rgba(255,255,255,0.5); text-decoration: none; transition: all 0.3s;
+        }
+        .social-links a:hover { border-color: var(--accent); color: var(--accent); }
+
+        /* ── FLOATING WHATSAPP ── */
+        .wa-float {
+            position: fixed; bottom: 24px; right: 24px; z-index: 99;
+            width: 60px; height: 60px; border-radius: 50%;
+            background: var(--success); color: white; font-size: 28px;
+            display: flex; align-items: center; justify-content: center;
+            text-decoration: none; box-shadow: 0 6px 20px rgba(16,185,129,0.4);
+            transition: all 0.3s; animation: wa-pulse 2s infinite;
+        }
+        .wa-float:hover { transform: scale(1.1); box-shadow: 0 8px 30px rgba(16,185,129,0.5); }
+        @keyframes wa-pulse { 0%, 100% { box-shadow: 0 6px 20px rgba(16,185,129,0.4); } 50% { box-shadow: 0 6px 30px rgba(16,185,129,0.6); } }
+
+        /* ── RESPONSIVE ── */
+        @media (max-width: 1024px) {
+            .hero-content { grid-template-columns: 1fr; text-align: center; }
+            .hero p { margin: 0 auto 36px; }
+            .hero-btns { justify-content: center; }
+            .hero-stats { justify-content: center; }
+            .hero-card { max-width: 480px; margin: 0 auto; }
+            .services-grid { grid-template-columns: repeat(2, 1fr); }
+            .steps { grid-template-columns: repeat(2, 1fr); }
+            .step::after { display: none; }
+            .pricing-grid { grid-template-columns: 1fr; max-width: 400px; margin: 0 auto; }
+            .price-card.popular { transform: none; }
+            .testimonial-grid { grid-template-columns: 1fr; }
+            .footer-grid { grid-template-columns: 1fr 1fr; }
+        }
+        @media (max-width: 768px) {
+            .nav-links { display: none; }
+            .nav-cta { display: none; }
+            .hamburger { display: block; }
+            .hero h1 { font-size: 36px; }
+            .section-header h2 { font-size: 30px; }
+            .services-grid { grid-template-columns: 1fr; }
+            .steps { grid-template-columns: 1fr; }
+            .footer-grid { grid-template-columns: 1fr; }
+            .footer-bottom { flex-direction: column; gap: 16px; }
+        }
+
+        /* ── MOBILE NAV ── */
+        .mobile-nav {
+            display: none; position: fixed; top: 72px; left: 0; right: 0;
+            background: white; border-bottom: 1px solid var(--border);
+            padding: 20px 24px; z-index: 99;
+        }
+        .mobile-nav.open { display: block; }
+        .mobile-nav a {
+            display: block; padding: 12px 0; color: var(--text);
+            text-decoration: none; font-weight: 500; border-bottom: 1px solid var(--border);
+        }
+        .mobile-nav a:last-child { border: none; }
+
+        /* ── ANIMATIONS ── */
+        .fade-up { opacity: 0; transform: translateY(30px); transition: all 0.6s ease; }
+        .fade-up.visible { opacity: 1; transform: translateY(0); }
+    </style>
+</head>
+<body>
+
+<!-- NAVIGATION -->
+<nav id="navbar">
+    <div class="nav-inner">
+        <a href="#" class="logo">
+            <div class="logo-icon"><i class="fa-solid fa-shirt"></i></div>
+            <div class="logo-text">Pristine<span>.</span></div>
+        </a>
+        <ul class="nav-links">
+            <li><a href="#services">Services</a></li>
+            <li><a href="#how">How It Works</a></li>
+            <li><a href="#pricing">Pricing</a></li>
+            <li><a href="#reviews">Reviews</a></li>
+        </ul>
+        <a href="https://wa.me/2348000000000?text=Hello%20Pristine!%20I%20need%20dry%20cleaning%20service." class="nav-cta" target="_blank">
+            <i class="fa-brands fa-whatsapp"></i> Book Now
+        </a>
+        <button class="hamburger" onclick="document.getElementById('mobileNav').classList.toggle('open')">
+            <i class="fa-solid fa-bars"></i>
+        </button>
+    </div>
+</nav>
+<div class="mobile-nav" id="mobileNav">
+    <a href="#services" onclick="this.parentElement.classList.remove('open')">Services</a>
+    <a href="#how" onclick="this.parentElement.classList.remove('open')">How It Works</a>
+    <a href="#pricing" onclick="this.parentElement.classList.remove('open')">Pricing</a>
+    <a href="#reviews" onclick="this.parentElement.classList.remove('open')">Reviews</a>
+    <a href="https://wa.me/2348000000000" target="_blank" style="color: var(--success); font-weight: 700;">
+        <i class="fa-brands fa-whatsapp"></i> Book on WhatsApp
+    </a>
+</div>
+
+<!-- HERO -->
+<section class="hero">
+    <div class="container">
+        <div class="hero-content">
+            <div>
+                <div class="hero-badge">
+                    <i class="fa-solid fa-star"></i> #1 Rated in Abuja
+                </div>
+                <h1>Premium Garment Care <span>Delivered to Your Door</span></h1>
+                <p>Professional dry cleaning, expert stain removal, and crisp pressing — with free pickup & delivery across Wuse 2, Maitama, Garki, Utako & Gwarinpa.</p>
+                <div class="hero-btns">
+                    <a href="#booking" class="btn btn-primary">
+                        <i class="fa-solid fa-calendar-check"></i> Schedule Pickup
+                    </a>
+                    <a href="https://wa.me/2348000000000" class="btn btn-outline" target="_blank">
+                        <i class="fa-brands fa-whatsapp"></i> WhatsApp Us
+                    </a>
+                </div>
+                <div class="hero-stats">
+                    <div class="stat">
+                        <div class="stat-num">5,000+</div>
+                        <div class="stat-label">Happy Customers</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-num">4.9★</div>
+                        <div class="stat-label">Google Rating</div>
+                    </div>
+                    <div class="stat">
+                        <div class="stat-num">24hr</div>
+                        <div class="stat-label">Express Service</div>
+                    </div>
+                </div>
+            </div>
+            <div class="hero-card">
+                <h3><i class="fa-solid fa-bolt" style="color: var(--accent);"></i> Quick Booking</h3>
+                <div class="form-group">
+                    <label>Your Name</label>
+                    <input type="text" placeholder="e.g. Adeola Oluwafemi">
+                </div>
+                <div class="form-group">
+                    <label>WhatsApp Number</label>
+                    <input type="tel" placeholder="+234 8xx xxx xxxx">
+                </div>
+                <div class="form-group">
+                    <label>Pickup Address</label>
+                    <input type="text" placeholder="e.g. 12 Garki Street, Abuja">
+                </div>
+                <div class="form-group">
+                    <label>Service Needed</label>
+                    <select>
+                        <option value="">Select a service...</option>
+                        <option>Dry Cleaning</option>
+                        <option>Laundry & Ironing</option>
+                        <option>Suit & Formal Wear</option>
+                        <option>Express 24hr Service</option>
+                        <option>Stain Removal</option>
+                    </select>
+                </div>
+                <button class="btn btn-primary" style="margin-top: 8px;" onclick="alert('Booking submitted! We will contact you on WhatsApp shortly.')">
+                    <i class="fa-solid fa-paper-plane"></i> Submit Booking
+                </button>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- TRUST BAR -->
+<section class="trust">
+    <div class="container">
+        <div class="trust-inner">
+            <div class="trust-item"><i class="fa-solid fa-shield-halved"></i> 100% Satisfaction Guaranteed</div>
+            <div class="trust-item"><i class="fa-solid fa-truck-fast"></i> Free Pickup & Delivery</div>
+            <div class="trust-item"><i class="fa-solid fa-clock"></i> 24-Hour Express Available</div>
+            <div class="trust-item"><i class="fa-solid fa-leaf"></i> Eco-Friendly Solvents</div>
+            <div class="trust-item"><i class="fa-solid fa-lock"></i> Garment Insurance Included</div>
+        </div>
+    </div>
+</section>
+
+<!-- SERVICES -->
+<section class="services" id="services">
+    <div class="container">
+        <div class="section-header fade-up">
+            <div class="section-tag"><i class="fa-solid fa-sparkles"></i> What We Do</div>
+            <h2>Premium Garment Services</h2>
+            <p>From everyday laundry to luxury designer care — we handle every fabric with precision.</p>
+        </div>
+        <div class="services-grid">
+            <div class="service-card fade-up">
+                <div class="service-icon"><i class="fa-solid fa-shirt"></i></div>
+                <h3>Dry Cleaning</h3>
+                <p>Delicate fabrics, designer wear, suits, and evening gowns — cleaned with industry-grade solvents.</p>
+                <div class="price-tag">From ₦1,500</div>
+            </div>
+            <div class="service-card fade-up">
+                <div class="service-icon"><i class="fa-solid fa-soap"></i></div>
+                <h3>Wash & Iron</h3>
+                <p>High-capacity washing with fabric-specific cycles and crisp, professional pressing.</p>
+                <div class="price-tag">From ₦800/kg</div>
+            </div>
+            <div class="service-card fade-up">
+                <div class="service-icon"><i class="fa-solid fa-wand-magic-sparkles"></i></div>
+                <h3>Stain Removal</h3>
+                <p>Stubborn stains, wine, ink, oil — our specialists use targeted treatments for perfect results.</p>
+                <div class="price-tag">From ₦2,000</div>
+            </div>
+            <div class="service-card fade-up">
+                <div class="service-icon"><i class="fa-solid fa-bolt"></i></div>
+                <h3>Express 24hr</h3>
+                <p>Same-day turnaround for urgent needs. Free express pickup within the city.</p>
+                <div class="price-tag">+50% rush fee</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section class="how" id="how">
+    <div class="container">
+        <div class="section-header fade-up">
+            <div class="section-tag"><i class="fa-solid fa-list-ol"></i> Simple Process</div>
+            <h2>How It Works</h2>
+            <p>Three easy steps to fresh, perfectly pressed garments.</p>
+        </div>
+        <div class="steps">
+            <div class="step fade-up">
+                <div class="step-num">1</div>
+                <h4>Book a Pickup</h4>
+                <p>WhatsApp us or fill the form. Choose your preferred time slot.</p>
+            </div>
+            <div class="step fade-up">
+                <div class="step-num">2</div>
+                <h4>We Collect</h4>
+                <p>Our driver arrives at your doorstep, tags your items, and takes them to our facility.</p>
+            </div>
+            <div class="step fade-up">
+                <div class="step-num">3</div>
+                <h4>Expert Care</h4>
+                <p>Each garment is inspected, pre-treated, cleaned, and pressed to perfection.</p>
+            </div>
+            <div class="step fade-up">
+                <div class="step-num">4</div>
+                <h4>Delivered Fresh</h4>
+                <p>Clean, pressed, and packaged — delivered back to your door within 24-48 hours.</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- PRICING -->
+<section class="pricing" id="pricing">
+    <div class="container">
+        <div class="section-header fade-up">
+            <div class="section-tag"><i class="fa-solid fa-tag"></i> Pricing</div>
+            <h2>Transparent & Fair</h2>
+            <p>No hidden fees. Pay only for what you use.</p>
+        </div>
+        <div class="pricing-grid">
+            <div class="price-card fade-up">
+                <h3>Essential</h3>
+                <div class="price">₦1,500 <span>/ item</span></div>
+                <ul>
+                    <li>Shirts & blouses</li>
+                    <li>Trousers & skirts</li>
+                    <li>Casual wear</li>
+                    <li>24-48 hour turnaround</li>
+                </ul>
+                <a href="https://wa.me/2348000000000?text=Hello!%20I%20want%20Essential%20plan%20dry%20cleaning." class="btn btn-primary" target="_blank" style="width: 100%; justify-content: center;">
+                    <i class="fa-brands fa-whatsapp"></i> Book Now
+                </a>
+            </div>
+            <div class="price-card popular fade-up">
+                <h3>Premium</h3>
+                <div class="price">₦2,500 <span>/ item</span></div>
+                <ul>
+                    <li>Suits & formal wear</li>
+                    <li>Silk & delicate fabrics</li>
+                    <li>Full press & fold</li>
+                    <li>Free garment bag</li>
+                    <li>Priority 24hr turnaround</li>
+                </ul>
+                <a href="https://wa.me/2348000000000?text=Hello!%20I%20want%20Premium%20plan%20dry%20cleaning." class="btn btn-primary" target="_blank" style="width: 100%; justify-content: center;">
+                    <i class="fa-brands fa-whatsapp"></i> Book Now
+                </a>
+            </div>
+            <div class="price-card fade-up">
+                <h3>Laundry Bundle</h3>
+                <div class="price">₦3,000 <span>/ 10kg</span></div>
+                <ul>
+                    <li>Wash, dry & iron</li>
+                    <li>Detergent-free option</li>
+                    <li>Free pickup & delivery</li>
+                    <li>Family-size loads welcome</li>
+                </ul>
+                <a href="https://wa.me/2348000000000?text=Hello!%20I%20want%20Laundry%20Bundle%20service." class="btn btn-primary" target="_blank" style="width: 100%; justify-content: center;">
+                    <i class="fa-brands fa-whatsapp"></i> Book Now
+                </a>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- TESTIMONIALS -->
+<section class="testimonials" id="reviews">
+    <div class="container">
+        <div class="section-header fade-up">
+            <div class="section-tag" style="color: var(--accent);"><i class="fa-solid fa-quote-left"></i> Testimonials</div>
+            <h2>What Our Customers Say</h2>
+            <p>Trusted by thousands of Abuja professionals.</p>
+        </div>
+        <div class="testimonial-grid">
+            <div class="testimonial-card fade-up">
+                <div class="stars">★★★★★</div>
+                <p>"Pristine handles my executive suits perfectly every time. The pickup and delivery is so convenient — I never visit a dry cleaner anymore."</p>
+                <div class="testimonial-author">
+                    <div class="testimonial-avatar">AO</div>
+                    <div>
+                        <div class="testimonial-name">Adeola Oluwafemi</div>
+                        <div class="testimonial-role">Banking Executive, Wuse 2</div>
+                    </div>
+                </div>
+            </div>
+            <div class="testimonial-card fade-up">
+                <div class="stars">★★★★★</div>
+                <p>"They removed a wine stain I thought was permanent from my wedding dress. Incredible work. I recommend them to everyone in Maitama."</p>
+                <div class="testimonial-author">
+                    <div class="testimonial-avatar">FI</div>
+                    <div>
+                        <div class="testimonial-name">Fatima Ibrahim</div>
+                        <div class="testimonial-role">Lawyer, Maitama</div>
+                    </div>
+                </div>
+            </div>
+            <div class="testimonial-card fade-up">
+                <div class="stars">★★★★★</div>
+                <p>"The express service saved me before my interview. Drop off in the morning, fresh suit by 5pm. Amazing turnaround time!"</p>
+                <div class="testimonial-author">
+                    <div class="testimonial-avatar">EM</div>
+                    <div>
+                        <div class="testimonial-name">Emeka Mathew</div>
+                        <div class="testimonial-role">Tech Entrepreneur, Gwarinpa</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- CTA -->
+<section class="cta-section">
+    <div class="container fade-up">
+        <h2>Ready for Spotless, Fresh Garments?</h2>
+        <p>Join 5,000+ happy customers across Abuja. First-time customers get 15% off!</p>
+        <div class="cta-btns">
+            <a href="https://wa.me/2348000000000?text=Hello!%20I%27m%20a%20new%20customer%20and%20want%20to%20try%20your%20service." class="btn btn-whatsapp" target="_blank">
+                <i class="fa-brands fa-whatsapp"></i> Get 15% Off First Order
+            </a>
+            <a href="#booking" class="btn btn-outline">Book Online</a>
+        </div>
+    </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+    <div class="container">
+        <div class="footer-grid">
+            <div class="footer-brand">
+                <span class="logo-text" style="font-family: 'Playfair Display', serif;">Pristine<span style="color: var(--accent);">.</span></span>
+                <p>Abuja's premium dry cleaning & garment care service. Free pickup & delivery across Wuse 2, Maitama, Garki, Utako & Gwarinpa.</p>
+                <div class="social-links" style="margin-top: 20px;">
+                    <a href="#"><i class="fa-brands fa-instagram"></i></a>
+                    <a href="#"><i class="fa-brands fa-twitter"></i></a>
+                    <a href="#"><i class="fa-brands fa-facebook"></i></a>
+                    <a href="https://wa.me/2348000000000" target="_blank"><i class="fa-brands fa-whatsapp"></i></a>
+                </div>
+            </div>
+            <div class="footer-col">
+                <h4>Services</h4>
+                <a href="#services">Dry Cleaning</a>
+                <a href="#services">Wash & Iron</a>
+                <a href="#services">Stain Removal</a>
+                <a href="#services">Express 24hr</a>
+                <a href="#services">Garment Storage</a>
+            </div>
+            <div class="footer-col">
+                <h4>Locations</h4>
+                <a href="#">Wuse 2</a>
+                <a href="#">Maitama</a>
+                <a href="#">Garki</a>
+                <a href="#">Utako</a>
+                <a href="#">Gwarinpa</a>
+            </div>
+            <div class="footer-col">
+                <h4>Contact</h4>
+                <a href="tel:+2348000000000"><i class="fa-solid fa-phone"></i> +234 800 000 0000</a>
+                <a href="mailto:hello@pristine.ng"><i class="fa-solid fa-envelope"></i> hello@pristine.ng</a>
+                <a href="#"><i class="fa-solid fa-location-dot"></i> 12A Wuse 2, Abuja</a>
+                <a href="#"><i class="fa-solid fa-clock"></i> Mon-Sat: 8am - 7pm</a>
+            </div>
+        </div>
+        <div class="footer-bottom">
+            <p>&copy; 2026 Pristine Dry Cleaners. All rights reserved.</p>
+            <p>Powered by <strong style="color: var(--accent);">IconEdge Technologies</strong></p>
+        </div>
+    </div>
+</footer>
+
+<!-- FLOATING WHATSAPP -->
+<a href="https://wa.me/2348000000000?text=Hello!%20I%20need%20dry%20cleaning%20service." class="wa-float" target="_blank" aria-label="Chat on WhatsApp">
+    <i class="fa-brands fa-whatsapp"></i>
+</a>
+
+<script>
+// Navbar scroll effect
+window.addEventListener('scroll', () => {
+    document.getElementById('navbar').classList.toggle('scrolled', window.scrollY > 50);
+});
+
+// Fade-up on scroll
+const observer = new IntersectionObserver((entries) => {
+    entries.forEach(e => { if (e.isIntersecting) { e.target.classList.add('visible'); } });
+}, { threshold: 0.1 });
+document.querySelectorAll('.fade-up').forEach(el => observer.observe(el));
+
+// Set current year
+document.getElementById('year') && (document.getElementById('year').textContent = new Date().getFullYear());
+</script>
+
+</body>
+</html>

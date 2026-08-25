@@ -1,0 +1,351 @@
+"""Cross-encoder reranker — the memory-v2 precision stage (spec §relevance).
+
+The dense lane is a BI-ENCODER: it embeds the query and each memory SEPARATELY,
+so it can't judge fine relevance — "how old is my baby" scores "I bought a cat"
+almost as high as "I have a 7-month-old son" (measured 2026-06-22). A CROSS-encoder
+reads (query, memory) TOGETHER and scores their relevance directly. That's the
+standard RAG fix; it's too slow to run over the whole store, so it runs only over
+the small FUSED candidate set at query time, re-orders it, and drops candidates
+below a score floor.
+
+Main-process-only + lazy + Null fallback, mirroring ``embedding_provider`` — an
+agent subprocess must never load a model; a missing dep degrades to "no rerank"
+(fusion order kept) rather than crashing.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from abc import ABC, abstractmethod
+
+logger = logging.getLogger("memory.reranker")
+
+DEFAULT_RERANKER = "BAAI/bge-reranker-v2-m3"
+# Set by the FastAPI lifespan in the main process (same flag the embedder uses).
+MAIN_PROCESS_ENV = "JARVIS_MAIN_PROCESS"
+
+
+class Reranker(ABC):
+    @abstractmethod
+    def is_available(self) -> bool: ...
+
+    @abstractmethod
+    def rerank(self, query: str, documents: list[str]) -> list[float]:
+        """Relevance score per document (higher = more relevant), SAME order as
+        ``documents``."""
+
+    def is_loaded(self) -> bool:
+        """True once the model is warm in memory. Default True (no lazy cost);
+        only the lazy LM rerankers override it. The recall path checks this so it
+        NEVER blocks a turn on a cold model load — it skips to fusion order until
+        the model is warm."""
+        return True
+
+    def warm(self) -> None:
+        """Block-load the model. Call OFF the request path (boot / background)."""
+
+    def warm_async(self) -> None:
+        """Kick off a ONE-SHOT background load — idempotent, non-blocking. Safe to
+        call from a request path: returns immediately, the model loads in a daemon
+        thread, and the caller keeps fusion order until ``is_loaded()`` flips."""
+        if self.is_loaded():
+            return
+        import threading
+        lock = self.__dict__.setdefault("_warm_lock", threading.Lock())
+        with lock:
+            if self.__dict__.get("_warming") or self.is_loaded():
+                return
+            self.__dict__["_warming"] = True
+
+        def _bg() -> None:
+            try:
+                self.warm()
+                logger.info("[MEMORY] reranker warm complete (background)")
+            except Exception as exc:  # noqa: BLE001 — warm is best-effort
+                logger.warning("[MEMORY] reranker background warm failed: %s", exc)
+            finally:
+                self.__dict__["_warming"] = False
+
+        threading.Thread(target=_bg, name="reranker-warm", daemon=True).start()
+
+
+class NullReranker(Reranker):
+    """Used when the reranker dep/model is unavailable — callers check
+    ``is_available()`` and keep the fusion order."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def is_available(self) -> bool:
+        return False
+
+    def rerank(self, query, documents):
+        raise RuntimeError(f"reranker unavailable: {self.reason}")
+
+
+class CrossEncoderReranker(Reranker):
+    """Lazy ``sentence-transformers`` CrossEncoder (e.g. ``bge-reranker-v2-m3``),
+    loaded once in the main process. (FlagEmbedding's FlagReranker is NOT used —
+    it calls ``tokenizer.prepare_for_model`` which transformers 5.x removed.)"""
+
+    def __init__(self, model_name: str = DEFAULT_RERANKER, max_length: int = 512):
+        self._model_name = model_name
+        self._max_length = max_length
+        self._model = None
+
+    def is_available(self) -> bool:
+        return True
+
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    def warm(self) -> None:
+        self._ensure_model()
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return
+        if not os.environ.get(MAIN_PROCESS_ENV):
+            raise RuntimeError(
+                "reranker load attempted outside the main backend process; "
+                "agents must use the memory API, not load models.")
+        from sentence_transformers import CrossEncoder  # heavy, lazy
+        self._model = CrossEncoder(self._model_name, max_length=self._max_length)
+        logger.info("[MEMORY] Loaded reranker %s", self._model_name)
+
+    def rerank(self, query: str, documents: list[str]) -> list[float]:
+        if not documents:
+            return []
+        self._ensure_model()
+        scores = self._model.predict([[query, d] for d in documents])
+        return [float(s) for s in scores]
+
+
+# Query-side instruction for Qwen3-Reranker — the personal-relevance framing.
+# Measured 2026-06-23 head-to-head on the live Vietnamese store: Qwen3-Reranker
+# ranks the direct answer #1 ("where do I work" → AcmeCorp 0.245 live) where
+# bge-reranker-v2-m3 buried it at 0.0013, and gives a usable score SPREAD (so a
+# floor can gate) — bge compressed every score near 0, ungateable. The cost is
+# latency: one batched forward pass of a 0.6B LM over the candidates (~1.2–1.4s
+# p50/p95 end-to-end on CPU, vs bge's classification head) — accelerated to
+# cuda/mps when present. Worth it for the ranking + precision gain.
+QWEN_RERANK_INSTRUCT = (
+    "The user is searching their OWN personal memory. A document is relevant ONLY "
+    "if it states a personal fact about the user needed to answer this specific "
+    "question about themselves; a general-knowledge question that merely mentions "
+    "a keyword is NOT relevant.")
+
+
+class Qwen3Reranker(Reranker):
+    """Qwen3-Reranker scored via the yes/no NEXT-TOKEN logit — a causal LM, NOT a
+    SequenceClassification cross-encoder, so it can't use the CrossEncoder path.
+    Instruction-aware. Lazy + main-process-only, like the embedder."""
+
+    def __init__(self, model_name: str, max_length: int = 512,
+                 instruct: str = QWEN_RERANK_INSTRUCT):
+        self._model_name = model_name
+        self._max_length = max_length
+        self._instruct = instruct
+        self._model = None
+        self._tok = None
+        self._yes = self._no = None
+        self._pre = self._suf = None
+        self._device = "cpu"
+
+    def is_available(self) -> bool:
+        return True
+
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    def warm(self) -> None:
+        self._ensure_model()
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return
+        if not os.environ.get(MAIN_PROCESS_ENV):
+            raise RuntimeError(
+                "reranker load attempted outside the main backend process; "
+                "agents must use the memory API, not load models.")
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer  # heavy, lazy
+        # Use an accelerator when present (the 0.6B forward dominates recall
+        # latency on CPU); fp16 there, fp32 on CPU for numerical safety.
+        self._device = ("cuda" if torch.cuda.is_available()
+                        else "mps" if torch.backends.mps.is_available() else "cpu")
+        dtype = torch.float16 if self._device != "cpu" else torch.float32
+        self._tok = AutoTokenizer.from_pretrained(self._model_name, padding_side="left")
+        self._model = (AutoModelForCausalLM.from_pretrained(self._model_name, dtype=dtype)
+                       .to(self._device).eval())
+        self._yes = self._tok.convert_tokens_to_ids("yes")
+        self._no = self._tok.convert_tokens_to_ids("no")
+        # The fixed system/assistant scaffold around each (instruct, query, doc).
+        self._pre = self._tok.encode(
+            "<|im_start|>system\nJudge whether the Document meets the requirements "
+            "based on the Query and the Instruct provided. Note that the answer can "
+            "only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n",
+            add_special_tokens=False)
+        self._suf = self._tok.encode(
+            "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+            add_special_tokens=False)
+        logger.info("[MEMORY] Loaded reranker %s (Qwen3 yes/no logit, device=%s)",
+                    self._model_name, self._device)
+
+    def rerank(self, query: str, documents: list[str]) -> list[float]:
+        if not documents:
+            return []
+        self._ensure_model()
+        import torch
+        seqs = [
+            self._pre + self._tok.encode(
+                f"<Instruct>: {self._instruct}\n<Query>: {query}\n<Document>: {d}",
+                add_special_tokens=False, max_length=self._max_length, truncation=True)
+            + self._suf
+            for d in documents
+        ]
+        ml = max(len(s) for s in seqs)
+        pad = self._tok.pad_token_id or 0
+        dev = self._device
+        ids = torch.tensor([[pad] * (ml - len(s)) + s for s in seqs], device=dev)   # left-pad
+        att = torch.tensor([[0] * (ml - len(s)) + [1] * len(s) for s in seqs], device=dev)
+        with torch.no_grad():
+            logits = self._model(input_ids=ids, attention_mask=att).logits[:, -1, :].float()
+        # P(yes) from the softmax over the [no, yes] next-token logits.
+        probs = torch.softmax(torch.stack([logits[:, self._no], logits[:, self._yes]], 1), 1)[:, 1]
+        return [float(p) for p in probs]
+
+
+def _is_qwen(model_name: str) -> bool:
+    return "qwen" in (model_name or "").lower()
+
+
+def _have_st() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("sentence_transformers") is not None
+
+
+def _have_transformers() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("transformers") is not None
+
+
+_WARNED: set[str] = set()
+
+
+def _warn_once(reason: str) -> None:
+    # Key by reason so a missing-transformers warning never swallows a separate
+    # missing-sentence-transformers one (and vice versa).
+    if reason in _WARNED:
+        return
+    _WARNED.add(reason)
+    logger.warning("[MEMORY] %s not installed — reranker disabled; recall keeps "
+                   "fusion order. Install the 'memory' extra.", reason)
+
+
+def get_reranker(model_name: str = DEFAULT_RERANKER) -> Reranker:
+    # Dispatch by model, each behind ITS OWN availability gate: Qwen3-Reranker is a
+    # causal LM that needs `transformers` (NOT sentence-transformers); bge & other
+    # cross-encoders use the sentence-transformers CrossEncoder path. Gating the
+    # whole function on `_have_st()` wrongly disabled Qwen whenever ST was missing.
+    if _is_qwen(model_name):
+        if not _have_transformers():
+            _warn_once("transformers")
+            return NullReranker("transformers not installed")
+        return Qwen3Reranker(model_name)
+    if not _have_st():
+        _warn_once("sentence-transformers")
+        return NullReranker("sentence-transformers not installed")
+    return CrossEncoderReranker(model_name)
+
+
+# Process-wide shared instance (the model is loaded once; the orchestrator reuses it).
+_SHARED: Reranker | None = None
+_SHARED_KEY: str | None = None
+
+
+def get_shared_reranker(model_name: str = DEFAULT_RERANKER) -> Reranker:
+    global _SHARED, _SHARED_KEY
+    if _SHARED is None or _SHARED_KEY != model_name:
+        _SHARED = get_reranker(model_name)
+        _SHARED_KEY = model_name
+    return _SHARED
+
+
+def prefetch_and_warm(model_name: str, on_progress) -> None:
+    """Download (with byte-level progress) then load a reranker model into the
+    shared singleton, so the FIRST recall after a model switch never pays the
+    download/load on the request path.
+
+    ``on_progress(state, pct)`` is called with state in
+    ``downloading|loading|ready|error`` and an integer 0..100. The download %
+    is real (aggregated bytes); ``loading`` is indeterminate (pct stays at the
+    last download value). Best-effort: any failure ends in a single ``error``.
+
+    MUST run OFF the event loop (it blocks on network + a model load). The
+    callback is the only side-channel — it is expected to be thread-safe
+    (the API hook marshals it back onto the loop).
+    """
+    state = {"done": 0, "total": 0, "last_pct": -1}
+
+    def _emit(st: str, pct: int) -> None:
+        # Throttle: only fire when the integer pct actually advances, so a
+        # chunked download doesn't flood the SSE channel.
+        if st == "downloading" and pct == state["last_pct"]:
+            return
+        state["last_pct"] = pct
+        try:
+            on_progress(st, pct)
+        except Exception:  # noqa: BLE001 — progress is best-effort, never break the warm
+            logger.debug("[MEMORY] reranker progress callback failed", exc_info=True)
+
+    try:
+        _emit("downloading", 0)
+        try:
+            from huggingface_hub import snapshot_download
+            from tqdm.auto import tqdm as _tqdm
+
+            # Aggregate byte progress across HF's per-file bars. Only count the
+            # byte bars (unit == 'B'); HF's outer "Fetching N files" bar uses
+            # unit 'it' and would otherwise pollute the denominator.
+            class _ProgressTqdm(_tqdm):
+                def __init__(self, *a, **k):
+                    super().__init__(*a, **k)
+                    if self.unit == "B":
+                        state["total"] += (self.total or 0)
+
+                def update(self, n=1):
+                    r = super().update(n)
+                    if self.unit == "B" and state["total"]:
+                        state["done"] += n
+                        _emit("downloading",
+                              min(99, int(state["done"] * 100 / state["total"])))
+                    return r
+
+            snapshot_download(repo_id=model_name, tqdm_class=_ProgressTqdm)
+        except Exception as exc:  # noqa: BLE001 — already cached / offline / hub error
+            # Not fatal: the files may already be cached, in which case the
+            # load below still succeeds. Log and move on to the load phase.
+            logger.info("[MEMORY] reranker prefetch skipped/failed (%s) — trying load", exc)
+
+        _emit("loading", max(state["last_pct"], 99))
+        # Build + warm a FRESH instance, then publish it to the shared singleton
+        # ONLY after warm() succeeds. If we swapped _SHARED first (via
+        # get_shared_reranker) an orchestrator constructed during the warm window
+        # would grab the unwarmed model and pay the load on the request path — the
+        # exact hang this function exists to remove. Until we publish, recalls keep
+        # using the current _SHARED (the old, already-warm model).
+        global _SHARED, _SHARED_KEY
+        reranker = get_reranker(model_name)
+        reranker.warm()                       # blocks until weights are in RAM
+        if not reranker.is_available():
+            raise RuntimeError("reranker unavailable after load (missing dep?)")
+        _SHARED, _SHARED_KEY = reranker, model_name   # atomic publish, post-warm
+        _emit("ready", 100)
+        logger.info("[MEMORY] reranker '%s' downloaded + warmed", model_name)
+    except Exception as exc:  # noqa: BLE001 — surface one error event, never crash
+        logger.warning("[MEMORY] reranker prefetch_and_warm failed: %s", exc)
+        try:
+            on_progress("error", 0)
+        except Exception:  # noqa: BLE001
+            pass

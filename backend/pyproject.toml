@@ -1,0 +1,114 @@
+[project]
+name = "fast-agent-app"
+version = "0.1.0"
+description = "a simple fast-agent application"
+readme = "README.md"
+license = "MIT"
+requires-python = "<3.14,>=3.13.5"
+dependencies = [
+  "edge-tts>=7.2.3",
+  "fast-agent-mcp>=0.5.10",
+  "lunar-python>=1.4.8",
+  "pyaudio>=0.2.14",
+  "pygame>=2.6.1",
+  "speechrecognition>=3.14.4",
+  "python-roborock>=3.9.3",
+  "google-auth-oauthlib>=1.2.3",
+  "google-api-python-client>=2.187.0",
+  "yt-dlp>=2025.11.12",
+  "google-generativeai>=0.8.3",
+  "langchain-text-splitters>=1.0.0",
+  "beautifulsoup4>=4.12.3",
+  "requests>=2.32.3",
+  "aiofiles>=25.1.0",
+  "mutagen>=1.47.0",
+  # Database
+  "sqlalchemy>=2.0.0",
+  # WebAuthn (passkey login)
+  "webauthn>=2.5.0",
+  # Web scraping & MCP server
+  "scrapling[ai]>=0.4.2",
+  "croniter>=6.2.2",
+  "pyyaml>=6.0.3",
+  # Real-time voice (STT + streaming TTS); engines installed via realtimetts extras
+  "realtimestt>=0.3.104",
+  "realtimetts[edge,system,azure,elevenlabs,openai]>=0.6.1",
+  # Optional STT backend: Gipformer-65M Vietnamese (sherpa-onnx runtime).
+  # Wheel ships prebuilt for macOS/Linux/Windows; only loaded when the
+  # user picks the gipformer_vi backend in the voice settings.
+  # Licensing: the Gipformer model weights are MIT; sherpa-onnx itself
+  # is Apache-2.0 (attribution in the root NOTICE file). Both ship as
+  # data inside the wheel — see NOTICE for redistribution terms.
+  # Pin to 1.10.46 — last version that bundles libonnxruntime in the wheel.
+  # 1.12+ wheels drop the bundled dylib and require an external onnxruntime
+  # install whose ABI version exactly matches what sherpa-onnx was built
+  # against (currently 1.24.4), but faster-whisper transitively pulls
+  # onnxruntime>=1.25 — so on Python 3.13 the import always fails.
+  "sherpa-onnx==1.10.46",
+  "aiortc>=1.14.0",
+  "ladybug>=0.17.1",
+  "tzdata>=2026.2",
+]
+
+[project.optional-dependencies]
+# Dense/semantic memory retrieval (Agent Memory + Adaptive RAG). Optional so
+# the core install stays lean — without these the memory subsystem degrades to
+# SQLite FTS5 keyword search. The vector + graph store is LadybugDB (an embedded
+# dependency, not a separate container).
+memory = [
+  "FlagEmbedding>=1.4.0",        # BAAI/bge-m3 (optional, still selectable)
+  "sentence-transformers>=3.0",  # Qwen3-Embedding (default) + bge-reranker-v2-m3 cross-encoder
+  "einops",                      # required by some sentence-transformers models
+]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+fast-agent-mcp = { path = "./fast-agent", editable = true }
+# Submodule paths intentionally differ from the Python package names
+# (RealtimeSTT / RealtimeTTS) so that Python's PathFinder doesn't pick
+# up the submodule directory at cwd as a namespace package and shadow
+# the editable install. See test_voice_imports.py for the regression
+# guard.
+realtimestt    = { path = "./realtimestt_src", editable = true }
+realtimetts    = { path = "./realtimetts_src", editable = true }
+
+# Optional convenience entry point if you later package this app:
+[project.scripts]
+fast-agent-app = "agent:main"
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["agent"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "httpx>=0.27",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+norecursedirs = [
+  ".venv",
+  "fast-agent",
+  "mcp-atlassian",
+  "figma-ui-mcp",
+  "realtimestt_src",
+  "realtimetts_src",
+  "data",
+  "config",
+]
+markers = [
+  "slow: marks tests that spawn real subprocesses or take >1s",
+  "memory_eval: offline memory retrieval evaluation (run explicitly with -m memory_eval)",
+]
+# Eval suite is opt-in: it measures quality, not a pass/fail unit invariant.
+addopts = "-m 'not memory_eval'"

@@ -1,0 +1,362 @@
+# FastAgent Configuration — Core Business Systems Only
+#
+# Focus: Research → Leads → Outreach → WhatsApp → Jarvis
+# Everything else can be added later (Facebook, Instagram, TikTok)# Primary: Groq — verified tool_use support, free tier
+default_model: groq.openai/gpt-oss-120b
+
+# Session history window — how many messages to keep before auto-pruning.
+# Must be high enough to preserve agent system instructions + conversation context.
+session_history_window: 50
+
+mcp_timeline:
+  steps: 20
+  step_seconds: 15
+
+shell_execution:
+  timeout_seconds: 300
+  warning_seconds: 10
+
+logger:
+  path: "./fastagent.jsonl"
+  streaming: markdown
+  progress_display: true
+  show_chat: true
+  show_tools: true
+  truncate_tools: true
+
+mcp:
+  servers:
+    # ════════════════════════════════════════════════════════════════════════
+    # CORE BUSINESS SYSTEMS (Always needed)
+    # ════════════════════════════════════════════════════════════════════════
+
+    # Lead/Campaign/Creative memory — SQLite backed
+    shared-memory:
+      command: "python"
+      args: ["tools/shared_memory_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Lean lead memory (prospects only — for token-budget-sensitive agents)
+    lead-memory:
+      command: "python"
+      args: ["tools/lead_memory_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Per-agent durable memory
+    memory_server:
+      command: "python"
+      args: ["tools/memory_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+        JARVIS_RUNTIME_RPC_SOCKET: "${JARVIS_RUNTIME_RPC_SOCKET}"
+
+    # Time service
+    time-service:
+      command: "python"
+      args: ["tools/time_server.py"]
+
+    # ════════════════════════════════════════════════════════════════════════
+    # RESEARCH & LEAD GENERATION
+    # ════════════════════════════════════════════════════════════════════════
+
+    # Web search (DuckDuckGo)
+    web-search:
+      command: "python"
+      args: ["tools/web_search_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Multi-source parallel search (Twitter, LinkedIn, Crunchbase)
+    multi-source-search:
+      command: "python"
+      args: ["tools/multi_source_search_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # 25+ lead sources (directories, job boards, news, community)
+    lead-sources:
+      command: "python"
+      args: ["tools/lead_sources_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Web scraping
+    scrapling-server:
+      command: "scrapling"
+      args: ["mcp"]
+
+    # ════════════════════════════════════════════════════════════════════════
+    # OUTREACH & WHATSAPP
+    # ════════════════════════════════════════════════════════════════════════
+
+    # WhatsApp messaging
+    whatsapp-outreach:
+      command: "python"
+      args: ["tools/whatsapp_outreach_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Email (Gmail)
+    gmail:
+      command: "python"
+      args: ["tools/gmail_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+        JARVIS_API_KEY: "${JARVIS_API_KEY}"
+        JARVIS_MASTER_KEY: "${JARVIS_MASTER_KEY}"
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ADS & MARKETING
+    # ════════════════════════════════════════════════════════════════════════
+
+    # Meta Ads API
+    meta-marketing:
+      command: "python"
+      args: ["tools/meta_marketing_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+        META_ACCESS_TOKEN: "${META_ACCESS_TOKEN}"
+        PIPEBOARD_API_TOKEN: "${PIPEBOARD_API_TOKEN}"
+
+    # ════════════════════════════════════════════════════════════════════════
+    # JARVIS ORCHESTRATION
+    # ════════════════════════════════════════════════════════════════════════
+
+    # Agent spawn system
+    agent_spawner:
+      command: "python"
+      args: ["-m", "fast_agent.spawn.servers.agent_spawner_server"]
+      env:
+        PYTHONUNBUFFERED: "1"
+        JARVIS_API_KEY: "${JARVIS_API_KEY}"
+        JARVIS_API_BASE: "${JARVIS_API_BASE}"
+
+    # Team communication
+    team_communicate:
+      command: "python"
+      args: ["-m", "fast_agent.spawn.servers.team_communicate_server"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Meeting room
+    meeting_room:
+      command: "python"
+      args: ["-m", "fast_agent.spawn.servers.meeting_room_server"]
+      env:
+        PYTHONUNBUFFERED: "1"
+        JARVIS_DB_PATH: "data/jarvis.db"
+
+    # Email bus (inter-agent)
+    email:
+      command: "python"
+      args: ["-m", "fast_agent.spawn.servers.email_server"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Cron scheduler
+    cron-server:
+      command: "python"
+      args: ["tools/cron_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Approval system
+    approval-server:
+      command: "python"
+      args: ["tools/approval_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+        JARVIS_RUNTIME_RPC_SOCKET: "${JARVIS_RUNTIME_RPC_SOCKET}"
+
+    # Skill management
+    skill_server:
+      command: "python"
+      args: ["tools/skill_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+        JARVIS_RUNTIME_RPC_SOCKET: "${JARVIS_RUNTIME_RPC_SOCKET}"
+
+    # MCP server management
+    mcp_admin:
+      command: "python"
+      args: ["tools/mcp_admin_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+        JARVIS_RUNTIME_RPC_SOCKET: "${JARVIS_RUNTIME_RPC_SOCKET}"
+
+    # Team template management
+    team_template:
+      command: "python"
+      args: ["tools/team_template_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+        JARVIS_RUNTIME_RPC_SOCKET: "${JARVIS_RUNTIME_RPC_SOCKET}"
+
+    # Self-evolution (code updates)
+    self-evolution:
+      command: "python"
+      args: ["tools/self_evolution_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # System control
+    system-control:
+      command: "python"
+      args: ["tools/system_control_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # ════════════════════════════════════════════════════════════════════════
+    # INFRASTRUCTURE
+    # ════════════════════════════════════════════════════════════════════════
+
+    # Filesystem access
+    filesystem:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "./data"]
+
+    # Sequential thinking
+    sequential-thinking:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+
+    # IoT device control
+    iot-control:
+      command: "python"
+      args: ["tools/iot_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+        ROBOROCK_USERNAME: "${ROBOROCK_USERNAME}"
+        ROBOROCK_PASSWORD: "${ROBOROCK_PASSWORD}"
+        JARVIS_DB_PATH: "data/jarvis.db"
+        JARVIS_MASTER_KEY: "${JARVIS_MASTER_KEY}"
+
+    # ════════════════════════════════════════════════════════════════════════
+    # UTILITIES (Keep — lightweight, useful)
+    # ════════════════════════════════════════════════════════════════════════
+
+    # Team health monitoring
+    team-monitor:
+      command: "python"
+      args: ["tools/team_monitor_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Smart error handling
+    smart-escalation:
+      command: "python"
+      args: ["tools/smart_escalation_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Adaptive learning (preferences)
+    adaptive-learning:
+      command: "python"
+      args: ["tools/adaptive_learning_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    # Re-added servers
+    demo-builder:
+      command: "python"
+      args: ["tools/demo_builder_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    predictive-proactivity:
+      command: "python"
+      args: ["tools/predictive_proactivity_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    workflow-templates:
+      command: "python"
+      args: ["tools/workflow_templates_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    voice-briefing:
+      command: "python"
+      args: ["tools/voice_briefing_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    business-intel:
+      command: "python"
+      args: ["tools/business_intel_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    multi-user-rbac:
+      command: "python"
+      args: ["tools/multi_user_rbac_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    comm-hub:
+      command: "python"
+      args: ["tools/comm_hub_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    knowledge-base:
+      command: "python"
+      args: ["tools/knowledge_base_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    client-portal:
+      command: "python"
+      args: ["tools/client_portal_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    predictive-forecast:
+      command: "python"
+      args: ["tools/predictive_forecast_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    advanced-workflow:
+      command: "python"
+      args: ["tools/advanced_workflow_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    performance-cache:
+      command: "python"
+      args: ["tools/performance_cache_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    advanced-analytics:
+      command: "python"
+      args: ["tools/advanced_analytics_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    calendar-task:
+      command: "python"
+      args: ["tools/calendar_task_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    music-playlist:
+      command: "python"
+      args: ["tools/music_playlist_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    social-media:
+      command: "python"
+      args: ["tools/social_media_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"
+
+    seo-optimizer:
+      command: "python"
+      args: ["tools/seo_optimizer_server.py"]
+      env:
+        PYTHONUNBUFFERED: "1"

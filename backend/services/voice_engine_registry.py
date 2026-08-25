@@ -1,0 +1,374 @@
+"""Voice engine registry — single source of truth for STT/TTS plug-and-play.
+
+Each entry declares:
+  * the importable class (lazy-loaded)
+  * the user-facing parameters with type/default/options metadata so the UI
+    can render a form without knowing about each engine
+  * declared system requirements (binaries, API keys) so the wizard can
+    surface "missing prerequisites" hints
+  * declared secret keys so the API layer never leaks plaintext
+
+Adding a new engine = adding one entry here. The Setup Wizard, Settings tab,
+factory, and runtime_config dispatcher all read from this dict — no other
+file needs editing for plug-and-play to extend.
+"""
+from __future__ import annotations
+
+from typing import Any, Literal, Optional, TypedDict
+
+
+ParamType = Literal["select", "text", "number", "slider", "toggle", "secret"]
+
+
+class ParamSpec(TypedDict, total=False):
+    key: str
+    type: ParamType
+    label: str
+    help: str
+    default: Any
+    options: list[Any]
+    min: float
+    max: float
+    step: float
+
+
+class TTSEngineSpec(TypedDict, total=False):
+    label: str
+    description: str
+    badges: list[str]
+    requires: list[str]
+    secrets: list[str]
+    params: list[ParamSpec]
+    realtimetts_engine: str   # class name in RealtimeTTS module
+    output_format: Literal["mp3", "pcm"]
+
+
+class STTBackendSpec(TypedDict, total=False):
+    label: str
+    description: str
+    badges: list[str]
+    params: list[ParamSpec]
+    # Encrypted credential slots (e.g. cloud STT API keys). Same shape as
+    # TTSEngineSpec.secrets — the UI renders an inline "set/clear" control
+    # per slot and the value is persisted via voice_config.set_engine_secret.
+    secrets: list[str]
+    wake_word_backends: dict[str, dict[str, Any]]
+    # If set, the backend supports only this BCP-47 language code. The UI
+    # hides the language picker and the saved config forces this value.
+    # Used by single-language engines (e.g. Gipformer = vi-only).
+    language_locked: str
+
+
+# Voice picker for Edge defaults to common vi/en voices. The list is intentionally
+# short — a "Refresh from server" button on the UI calls /api/voice/engines/edge/voices
+# to populate the full ~400-voice catalog dynamically.
+_EDGE_DEFAULT_VOICES = [
+    "en-GB-RyanNeural",
+    "en-GB-ThomasNeural",
+    "en-US-ChristopherNeural",
+    "en-US-BrianMultilingualNeural",
+    "en-US-AndrewMultilingualNeural",
+    "en-US-AriaNeural",
+    "en-US-GuyNeural",
+]
+
+
+TTS_ENGINES: dict[str, TTSEngineSpec] = {
+    "edge": {
+        "label": "Microsoft Edge TTS",
+        "description": "Free, high-fidelity native British and American neural voices. Recommended default.",
+        "badges": ["free", "cloud", "british+american"],
+        "requires": [],
+        "secrets": [],
+        "realtimetts_engine": "EdgeEngine",
+        "output_format": "mp3",
+        "params": [
+            {
+                "key": "voice",
+                "type": "select",
+                "label": "Voice",
+                "default": "en-GB-RyanNeural",
+                "options": _EDGE_DEFAULT_VOICES,
+                "help": "Click 'Refresh voices' in UI to fetch the full catalog.",
+            },
+            {
+                "key": "rate",
+                "type": "text",
+                "label": "Speech rate",
+                "default": "+0%",
+                "help": "edge-tts rate string, e.g. '+0%', '+20%', '-10%'.",
+            },
+        ],
+    },
+    "system": {
+        "label": "System TTS (pyttsx3)",
+        "description": "Built-in OS voice. No network. Quality varies by platform.",
+        "badges": ["free", "local", "offline"],
+        "requires": [],
+        "secrets": [],
+        "realtimetts_engine": "SystemEngine",
+        "output_format": "pcm",
+        "params": [
+            {"key": "voice", "type": "text", "label": "Voice id", "default": "", "help": "Leave empty for system default."},
+            {"key": "rate", "type": "number", "label": "Rate (wpm)", "default": 200, "min": 50, "max": 400, "step": 10},
+        ],
+    },
+    "azure": {
+        "label": "Azure Speech",
+        "description": "500+ voices, high quality. Free tier 500k chars/month.",
+        "badges": ["cloud", "high-quality"],
+        "requires": [],
+        "secrets": ["api_key", "region"],
+        "realtimetts_engine": "AzureEngine",
+        "output_format": "mp3",
+        "params": [
+            {"key": "voice", "type": "text", "label": "Voice", "default": "en-US-GuyNeural"},
+        ],
+    },
+    "elevenlabs": {
+        "label": "ElevenLabs",
+        "description": "Premium quality, cinematic voice synthesis. Default for Jarvis.",
+        "badges": ["cloud", "paid", "code-switch", "default"],
+        "requires": ["mpv"],
+        "secrets": ["api_key"],
+        "realtimetts_engine": "ElevenlabsEngine",
+        "output_format": "mp3",
+        "params": [
+            {"key": "voice", "type": "text", "label": "Voice id or name", "default": "Daniel"},
+            {"key": "model", "type": "select", "label": "Model", "default": "eleven_multilingual_v2", "options": ["eleven_multilingual_v2", "eleven_turbo_v2", "eleven_monolingual_v1"]},
+            {"key": "stability", "type": "slider", "label": "Stability", "default": 0.55, "min": 0, "max": 1, "step": 0.05},
+            {"key": "similarity_boost", "type": "slider", "label": "Clarity", "default": 0.78, "min": 0, "max": 1, "step": 0.05},
+            {"key": "style", "type": "slider", "label": "Expressiveness", "default": 0.35, "min": 0, "max": 1, "step": 0.05},
+            {"key": "speed", "type": "slider", "label": "Speed", "default": 1.05, "min": 0.5, "max": 1.5, "step": 0.05},
+        ],
+    },
+    "openai": {
+        "label": "OpenAI TTS",
+        "description": "6 voices, multilingual, premium pricing.",
+        "badges": ["cloud", "paid"],
+        "requires": ["ffmpeg"],
+        "secrets": ["api_key"],
+        "realtimetts_engine": "OpenAIEngine",
+        "output_format": "mp3",
+        "params": [
+            {"key": "voice", "type": "select", "label": "Voice", "default": "alloy", "options": ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]},
+            {"key": "model", "type": "select", "label": "Model", "default": "tts-1", "options": ["tts-1", "tts-1-hd"]},
+        ],
+    },
+    # Soniox real-time TTS — WebSocket streaming, 60+ languages, low TTFB.
+    # Bypasses RealtimeTTS (no engine class in that library); the provider
+    # lives in services/tts_backends/soniox.py and is wired in
+    # tts_realtime.build_chat_provider.
+    "soniox": {
+        "label": "Soniox TTS (real-time)",
+        "description": "Cloud WebSocket TTS, 60+ languages, low-latency streaming.",
+        "badges": ["cloud", "paid", "multilingual"],
+        "requires": [],
+        "secrets": ["api_key"],
+        "output_format": "mp3",
+        # Voice list is the full Soniox catalog as of tts-rt-v1 (28 studio
+        # voices — every voice can speak every supported language; pick one
+        # for accent/timbre, switch ``language`` for the actual locale).
+        # Source: https://soniox.com/docs/tts/concepts/voices
+        # Language list is curated to the locales we care about in this app
+        # (vi+en first, then common globals). Anyone needing a Soniox-supported
+        # code we don't list yet should add it here — the backend accepts any
+        # ISO code; the UI dropdown is the only thing gating it.
+        "params": [
+            {"key": "model", "type": "select", "label": "Model", "default": "tts-rt-v1", "options": ["tts-rt-v1"]},
+            {"key": "voice", "type": "select", "label": "Voice", "default": "Adrian", "options": [
+                # Male
+                "Adrian", "Arjun", "Arthur", "Cooper", "Daniel", "Jack", "Kenji",
+                "Mason", "Mateo", "Noah", "Oliver", "Owen", "Rafael", "Rohan",
+                # Female
+                "Claire", "Elise", "Emma", "Grace", "Isla", "Lucia", "Maya",
+                "Meera", "Mina", "Nina", "Priya", "Ruby", "Sofia", "Victoria",
+            ]},
+            {"key": "language", "type": "select", "label": "Language", "default": "en", "options": [
+                "en", "vi", "zh", "ja", "ko", "fr", "de", "es", "pt", "it",
+                "ru", "ar", "hi", "id", "th",
+            ]},
+            {"key": "sample_rate", "type": "select", "label": "Sample rate", "default": 24000, "options": [8000, 16000, 24000, 44100, 48000]},
+        ],
+    },
+}
+
+
+STT_BACKENDS: dict[str, STTBackendSpec] = {
+    "faster_whisper": {
+        "label": "faster-whisper (local)",
+        "description": "Local inference via faster-whisper. No API key. CPU works on tiny/base.",
+        "badges": ["free", "local", "vi+en"],
+        # Defaults mirror RealtimeVoiceChat's DEFAULT_RECORDER_CONFIG (the
+        # author's own voice-chat reference impl). silero_sensitivity 0.05 is
+        # the critical one: 0.4 (Silero default) was strict enough that
+        # AirPods-level speech (peak ~1200) didn't trigger VAD at all.
+        "params": [
+            {"key": "model", "type": "select", "label": "Final model", "default": "base", "options": ["tiny", "base", "small", "medium", "large-v2", "large-v3"]},
+            {"key": "realtime_model_type", "type": "select", "label": "Realtime model", "default": "base", "options": ["tiny", "base", "small"]},
+            {"key": "language", "type": "select", "label": "Language", "default": "auto", "options": ["en", "auto", "vi"]},
+            {"key": "compute_type", "type": "select", "label": "Compute type", "default": "int8", "options": ["int8", "float16", "float32"]},
+            {"key": "silero_sensitivity", "type": "slider", "label": "VAD sensitivity (Silero)", "default": 0.05, "min": 0, "max": 1, "step": 0.05},
+            {"key": "webrtc_sensitivity", "type": "number", "label": "VAD sensitivity (WebRTC, 0-3)", "default": 3, "min": 0, "max": 3, "step": 1},
+            {"key": "post_speech_silence_duration", "type": "number", "label": "End-of-speech silence (s)", "default": 0.7, "min": 0.2, "max": 3.0, "step": 0.1},
+            {"key": "min_length_of_recording", "type": "number", "label": "Min recording length (s)", "default": 0.5, "min": 0.0, "max": 3.0, "step": 0.1},
+            {"key": "min_gap_between_recordings", "type": "number", "label": "Min gap between recordings (s)", "default": 0, "min": 0.0, "max": 3.0, "step": 0.1},
+            {"key": "beam_size", "type": "number", "label": "Beam size (final)", "default": 3, "min": 1, "max": 10},
+            {"key": "beam_size_realtime", "type": "number", "label": "Beam size (realtime)", "default": 3, "min": 1, "max": 10},
+            {"key": "realtime_processing_pause", "type": "number", "label": "Realtime processing pause (s)", "default": 0.03, "min": 0.0, "max": 1.0, "step": 0.01},
+            {"key": "enable_realtime_transcription", "type": "toggle", "label": "Stream partial transcripts", "default": True},
+            {"key": "silero_deactivity_detection", "type": "toggle", "label": "Silero deactivity detection (better end-of-speech)", "default": True},
+            {"key": "silero_use_onnx", "type": "toggle", "label": "Silero ONNX (faster CPU inference)", "default": True},
+            {"key": "faster_whisper_vad_filter", "type": "toggle", "label": "faster-whisper internal VAD filter", "default": False},
+            {"key": "allowed_latency_limit", "type": "number", "label": "Allowed latency limit (chunks)", "default": 500, "min": 50, "max": 5000, "step": 50},
+        ],
+        "wake_word_backends": {
+            "off": {"label": "Disabled", "params": []},
+            "porcupine": {
+                "label": "Picovoice Porcupine",
+                "params": [
+                    {"key": "wake_words", "type": "text", "label": "Wake word(s)", "default": "jarvis", "help": "Comma-separated."},
+                    {"key": "wake_words_sensitivity", "type": "slider", "label": "Sensitivity", "default": 0.6, "min": 0, "max": 1, "step": 0.05},
+                ],
+                "secrets": ["access_key"],
+            },
+            "oww": {
+                "label": "OpenWakeWord",
+                "params": [
+                    {"key": "wake_words", "type": "text", "label": "Wake word(s)", "default": "jarvis"},
+                    {"key": "wake_words_sensitivity", "type": "slider", "label": "Sensitivity", "default": 0.6, "min": 0, "max": 1, "step": 0.05},
+                ],
+                "secrets": [],
+            },
+        },
+    },
+    "gipformer_vi": {
+        "label": "Gipformer 65M (Vietnamese only)",
+        # The Gipformer MODEL weights are MIT. The sherpa-onnx RUNTIME
+        # that loads them is Apache-2.0 (see root NOTICE). Both are local.
+        "description": "Vietnamese-optimised Zipformer-RNNT via sherpa-onnx. ~73 MB int8. Model: MIT · Runtime: Apache-2.0.",
+        "badges": ["free", "local", "vi-only", "model:MIT", "runtime:Apache-2.0"],
+        "language_locked": "vi",
+        "params": [
+            {"key": "quantize", "type": "select", "label": "Quantization", "default": "int8", "options": ["int8", "fp32"]},
+            {"key": "decoding_method", "type": "select", "label": "Decoding", "default": "modified_beam_search", "options": ["greedy_search", "modified_beam_search"]},
+            {"key": "num_threads", "type": "number", "label": "CPU threads", "default": 4, "min": 1, "max": 16, "step": 1},
+            # Default 0.05 mirrors faster-whisper's RVC config — anything
+            # higher (the Silero default 0.5 is the worst offender) makes
+            # the AEC-suppressed user voice during TTS playback fall
+            # below threshold, which kills barge-in entirely.
+            {"key": "silero_sensitivity", "type": "slider", "label": "VAD threshold", "default": 0.05, "min": 0, "max": 1, "step": 0.05},
+            {"key": "post_speech_silence_duration", "type": "number", "label": "End-of-speech silence (s)", "default": 0.7, "min": 0.2, "max": 3.0, "step": 0.1},
+            {"key": "min_speech_duration", "type": "number", "label": "Min speech length (s)", "default": 0.25, "min": 0.05, "max": 2.0, "step": 0.05},
+        ],
+        # Wake-word path is not wired for sherpa-onnx — the loop reads
+        # straight off Silero VAD and there is no Porcupine/OWW callback
+        # plumbing. Surfacing only "off" prevents the UI from offering
+        # a config that would silently be ignored.
+        "wake_word_backends": {
+            "off": {"label": "Disabled", "params": []},
+        },
+    },
+    # Soniox real-time STT — WebSocket streaming, 60+ languages, endpoint
+    # detection. No local models; needs only an API key.
+    "soniox": {
+        "label": "Soniox STT (real-time)",
+        "description": "Cloud WebSocket STT, 60+ languages, server-side endpoint detection.",
+        "badges": ["cloud", "paid", "multilingual"],
+        "secrets": ["api_key"],
+        "params": [
+            {"key": "model", "type": "select", "label": "Model", "default": "stt-rt-v4", "options": ["stt-rt-v4"]},
+            {"key": "language_hints", "type": "text", "label": "Language hints", "default": "vi,en", "help": "Comma-separated ISO codes, or blank for auto."},
+            {"key": "enable_language_identification", "type": "toggle", "label": "Detect language per token", "default": False},
+            {"key": "enable_speaker_diarization", "type": "toggle", "label": "Speaker diarization", "default": False},
+        ],
+        # Soniox handles endpoint detection server-side ("<end>" token) and
+        # streams audio over a single WS — there is no separate wake-word
+        # callback hook, so we surface "off" only (same pattern as
+        # gipformer_vi).
+        "wake_word_backends": {
+            "off": {"label": "Disabled", "params": []},
+        },
+    },
+}
+
+
+# Voice infrastructure services — NOT TTS/STT engines (they never appear in
+# the engine pickers) but they share the same encrypted secret-slot plumbing
+# (voice.secrets.{name}.{slot}) so the Settings UI / Setup Wizard / API layer
+# handle them with zero new storage code.
+VOICE_SERVICES: dict[str, dict[str, Any]] = {
+    # WebRTC TURN relay — required for voice from networks that can't reach
+    # the host directly (phone on 4G/5G, any network outside your LAN/VPN).
+    # NOT needed for localhost / same-LAN / VPN use. Cloudflare Realtime TURN
+    # has a free 1 TB/month tier; the backend mints short-lived credentials
+    # from the long-term key pair entered here (key itself never reaches the
+    # browser). Env fallback: JARVIS_CF_TURN_KEY_ID / JARVIS_CF_TURN_API_TOKEN.
+    "cloudflare_turn": {
+        "label": "Cloudflare TURN (voice relay)",
+        "description": (
+            "Lets voice work from outside your network (e.g. phone on 4G/5G). "
+            "Not needed on localhost or LAN/VPN. Create a TURN app at "
+            "Cloudflare Dashboard → Realtime → TURN, then paste both values."
+        ),
+        "badges": ["cloud", "free-tier", "optional"],
+        "requires": [],
+        "secrets": ["key_id", "api_token"],
+        "params": [],
+        "docs_url": "https://developers.cloudflare.com/realtime/turn/",
+    },
+}
+
+
+def list_tts_engines() -> dict[str, TTSEngineSpec]:
+    return TTS_ENGINES
+
+
+def list_stt_backends() -> dict[str, STTBackendSpec]:
+    return STT_BACKENDS
+
+
+def get_tts_engine(name: str) -> Optional[TTSEngineSpec]:
+    return TTS_ENGINES.get(name)
+
+
+def get_stt_backend(name: str) -> Optional[STTBackendSpec]:
+    return STT_BACKENDS.get(name)
+
+
+def list_voice_services() -> dict[str, dict[str, Any]]:
+    return VOICE_SERVICES
+
+
+def get_voice_service(name: str) -> Optional[dict[str, Any]]:
+    return VOICE_SERVICES.get(name)
+
+
+def default_tts_chat_config() -> dict[str, Any]:
+    """First-run / fallback chat TTS config. ElevenLabs default for speed + quality."""
+    return {
+        "engine": "elevenlabs",
+        "params": {
+            "voice": "Daniel",
+            "model": "eleven_turbo_v2",  # Faster model for lower latency
+            "stability": 0.50,
+            "similarity_boost": 0.75,
+            "style": 0.30,
+            "speed": 1.10,  # Slightly faster speech
+        },
+    }
+
+
+def default_tts_stories_config() -> dict[str, Any]:
+    """Stories TTS — locked schema (no engine field; always Edge)."""
+    edge_params = {p["key"]: p.get("default") for p in TTS_ENGINES["edge"]["params"]}
+    return edge_params
+
+
+def default_stt_config() -> dict[str, Any]:
+    spec = STT_BACKENDS["faster_whisper"]
+    return {
+        "backend": "faster_whisper",
+        "params": {p["key"]: p.get("default") for p in spec["params"]},
+        "wake_word": {"backend": "off", "params": {}},
+    }

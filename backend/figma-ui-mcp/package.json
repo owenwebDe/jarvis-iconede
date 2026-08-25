@@ -1,0 +1,45 @@
+{
+  "name": "figma-ui-mcp",
+  "version": "1.9.1",
+  "description": "Bidirectional Figma MCP — draw UI with Claude, read design back to code",
+  "mcpName": "io.github.TranHoaiHung/figma-ui-mcp",
+  "type": "module",
+  "bin": {
+    "figma-ui-mcp": "./server/index.js"
+  },
+  "files": [
+    "server/index.js",
+    "server/bridge-server.js",
+    "server/code-executor.js",
+    "server/tool-definitions.js",
+    "server/api-docs.js",
+    "plugin/code.js",
+    "plugin/manifest.json",
+    "plugin/ui.html",
+    "plugin/icon16.png",
+    "plugin/icon32.png"
+  ],
+  "scripts": {
+    "start": "node server/index.js",
+    "build": "esbuild server/index.js --bundle --platform=node --format=esm --outfile=dist/server.mjs --minify",
+    "start:dist": "node dist/server.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4"
+  },
+  "engines": { "node": ">=18" },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  },
+  "keywords": ["figma", "mcp", "model-context-protocol", "claude", "ai", "design", "plugin", "figma-plugin", "ui-generation"],
+  "license": "MIT",
+  "author": "TranHoaiHung",
+  "homepage": "https://github.com/TranHoaiHung/figma-ui-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/TranHoaiHung/figma-ui-mcp/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TranHoaiHung/figma-ui-mcp"
+  }
+}
