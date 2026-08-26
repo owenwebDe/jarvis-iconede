@@ -71,7 +71,7 @@
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^26.1.0",
     "@vitejs/plugin-vue": "^6.0.7",
-    "electron": "^41.7.1",
+    "electron": "^43.4.1",
     "electron-builder": "^26.15.3",
     "js-yaml": "^5.2.1",
     "tailwindcss": "^4.2.2",
