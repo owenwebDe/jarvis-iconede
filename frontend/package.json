@@ -58,7 +58,7 @@
     "marked": "^18.0.5",
     "marked-highlight": "^2.2.4",
     "mermaid": "^11.16.0",
-    "pinia": "^3.0.4",
+    "pinia": "^4.0.3",
     "v-code-diff": "^1.13.1",
     "vue": "^3.5.39",
     "vue-codemirror": "^6.1.1",
